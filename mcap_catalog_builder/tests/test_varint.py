@@ -2,7 +2,7 @@
 
 import pytest
 
-from mcap_indexer.varint import (
+from mcap_catalog_builder.varint import (
     decode_counts_blob,
     decode_varint,
     encode_counts_blob,

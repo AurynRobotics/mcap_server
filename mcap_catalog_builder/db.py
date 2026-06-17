@@ -154,9 +154,9 @@ def resolve_topic_set(
 
 
 def record_failure(conn, key: str, error_text: str) -> None:
-    """Upsert an ``indexer_failures`` row (keyed by the raw object key)."""
+    """Upsert an ``catalog_failures`` row (keyed by the raw object key)."""
     conn.execute(
-        "INSERT INTO indexer_failures(s3_key, failed_at_ns, error_text) VALUES (?, ?, ?) "
+        "INSERT INTO catalog_failures(s3_key, failed_at_ns, error_text) VALUES (?, ?, ?) "
         "ON CONFLICT(s3_key) DO UPDATE SET "
         "failed_at_ns=excluded.failed_at_ns, error_text=excluded.error_text",
         (key, now_ns(), error_text),

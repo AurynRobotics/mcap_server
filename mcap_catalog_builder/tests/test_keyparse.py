@@ -2,7 +2,7 @@
 
 import os
 
-from mcap_indexer.keyparse import parse_hive_key, rebuild_hive_key, relpath_key
+from mcap_catalog_builder.keyparse import parse_hive_key, rebuild_hive_key, relpath_key
 
 VALID = (
     "customer=dexory/customer_site=nashville/robot=arri-182/"

@@ -2,7 +2,7 @@
 
 import pytest
 
-from mcap_indexer.db import (
+from mcap_catalog_builder.db import (
     load_caches,
     open_db,
     record_failure,
@@ -29,7 +29,7 @@ def test_open_db_creates_all_tables(conn):
     }
     expected = {
         "files", "customers", "sites", "robots", "sources", "topic_names",
-        "schemas", "topic_sets", "topic_set_members", "tags", "indexer_failures",
+        "schemas", "topic_sets", "topic_set_members", "tags", "catalog_failures",
     }
     assert expected <= tables
 
@@ -111,6 +111,6 @@ def test_record_failure_upserts(conn):
     record_failure(conn, "k1", "boom2")
     conn.commit()
     rows = conn.execute(
-        "SELECT error_text FROM indexer_failures WHERE s3_key='k1'"
+        "SELECT error_text FROM catalog_failures WHERE s3_key='k1'"
     ).fetchall()
     assert len(rows) == 1 and rows[0][0] == "boom2"

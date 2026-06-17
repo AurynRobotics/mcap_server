@@ -2,8 +2,8 @@
 
 import queue
 
-from mcap_indexer.__main__ import build_parser, main, worker_loop
-from mcap_indexer.watcher import WatchEvent
+from mcap_catalog_builder.__main__ import build_parser, main, worker_loop
+from mcap_catalog_builder.watcher import WatchEvent
 
 
 def test_parser_defaults():
@@ -28,31 +28,31 @@ def test_worker_loop_stops_on_stop_event(tmp_db, tmp_path):
     worker_loop(conn, caches, str(tmp_path), q, 3, 0.0)  # returns promptly → ok
 
 
-def test_worker_loop_processes_index_then_stop(tmp_db, tmp_path, monkeypatch):
+def test_worker_loop_processes_catalog_then_stop(tmp_db, tmp_path, monkeypatch):
     conn, caches = tmp_db
-    import mcap_indexer.__main__ as m
+    import mcap_catalog_builder.__main__ as m
 
-    indexed: list[str] = []
+    cataloged: list[str] = []
     monkeypatch.setattr(m, "wait_for_stable", lambda *a, **k: True)
-    monkeypatch.setattr(m, "index_file", lambda c, ca, p, r: indexed.append(p))
+    monkeypatch.setattr(m, "catalog_file", lambda c, ca, p, r: cataloged.append(p))
 
     q: queue.Queue = queue.Queue()
-    q.put(WatchEvent("index", "/w/a.mcap"))
+    q.put(WatchEvent("catalog", "/w/a.mcap"))
     q.put(WatchEvent("stop"))
     worker_loop(conn, caches, str(tmp_path), q, 3, 0.0)
-    assert indexed == ["/w/a.mcap"]
+    assert cataloged == ["/w/a.mcap"]
 
 
 def test_worker_loop_drops_unstable_file(tmp_db, tmp_path, monkeypatch):
     conn, caches = tmp_db
-    import mcap_indexer.__main__ as m
+    import mcap_catalog_builder.__main__ as m
 
-    indexed: list[str] = []
+    cataloged: list[str] = []
     monkeypatch.setattr(m, "wait_for_stable", lambda *a, **k: False)  # never stable
-    monkeypatch.setattr(m, "index_file", lambda c, ca, p, r: indexed.append(p))
+    monkeypatch.setattr(m, "catalog_file", lambda c, ca, p, r: cataloged.append(p))
 
     q: queue.Queue = queue.Queue()
-    q.put(WatchEvent("index", "/w/a.mcap"))
+    q.put(WatchEvent("catalog", "/w/a.mcap"))
     q.put(WatchEvent("stop"))
     worker_loop(conn, caches, str(tmp_path), q, 3, 0.0)
-    assert indexed == []  # unstable file dropped, not indexed
+    assert cataloged == []  # unstable file dropped, not cataloged

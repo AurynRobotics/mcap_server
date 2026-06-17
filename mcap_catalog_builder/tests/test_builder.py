@@ -1,20 +1,20 @@
-"""Tests for the indexer core: the §8 transaction, skip, failure, delete."""
+"""Tests for the catalog builder core: the §8 transaction, skip, failure, delete."""
 
 import os
 
 import pytest
 
-from mcap_indexer import indexer, mcap_summary
-from mcap_indexer.indexer import (
+from mcap_catalog_builder import builder, mcap_summary
+from mcap_catalog_builder.builder import (
     compute_set_fingerprint,
     delete_by_path,
-    index_file,
+    catalog_file,
     resolve_dimensions,
     synth_etag,
 )
-from mcap_indexer.mcap_summary import ChannelInfo, FileSummary
-from mcap_indexer.tests.fixtures import write_minimal_mcap
-from mcap_indexer.varint import decode_counts_blob
+from mcap_catalog_builder.mcap_summary import ChannelInfo, FileSummary
+from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
+from mcap_catalog_builder.varint import decode_counts_blob
 
 DIMS = {
     "customer": "dexory",
@@ -53,11 +53,11 @@ def test_fingerprint_is_stable_and_order_independent():
     assert compute_set_fingerprint([(1, 2), (3, 4)]) == compute_set_fingerprint([(3, 4), (1, 2)])
 
 
-def test_index_happy_path(tmp_db, tmp_path):
+def test_catalog_happy_path(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
     dest = _write_hive(root)
-    assert index_file(conn, caches, dest, root).status == "indexed"
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
 
     row = conn.execute("SELECT * FROM files").fetchone()
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
@@ -70,27 +70,27 @@ def test_index_happy_path(tmp_db, tmp_path):
     assert sum(counts) == 5  # 3 + 2 + 0; the zero-count channel is preserved
     assert row["has_error"] == 0
     assert row["etag"] == synth_etag(row["size_bytes"], row["last_modified_ns"])
-    assert row["indexed_at_ns"] > row["last_modified_ns"]
+    assert row["cataloged_at_ns"] > row["last_modified_ns"]
 
 
-def test_reindex_unchanged_is_skipped(tmp_db, tmp_path):
+def test_recatalog_unchanged_is_skipped(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
     dest = _write_hive(root)
-    assert index_file(conn, caches, dest, root).status == "indexed"
-    assert index_file(conn, caches, dest, root).status == "skipped"
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
+    assert catalog_file(conn, caches, dest, root).status == "skipped"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
     assert conn.execute("SELECT COUNT(*) FROM topic_set_members").fetchone()[0] == 3
 
 
-def test_mtime_change_reindexes(tmp_db, tmp_path):
+def test_mtime_change_recatalogs(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
     dest = _write_hive(root)
-    index_file(conn, caches, dest, root)
+    catalog_file(conn, caches, dest, root)
     st = os.stat(dest)
     os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
-    assert index_file(conn, caches, dest, root).status == "indexed"
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
 
 
@@ -100,9 +100,9 @@ def test_unparseable_key_records_failure(tmp_db, tmp_path):
     os.makedirs(root, exist_ok=True)
     dest = os.path.join(root, "flat.mcap")  # not Hive-structured
     write_minimal_mcap(dest, channels=[("/a", "S", "ros2msg", 1)])
-    assert index_file(conn, caches, dest, root).status == "failed"
+    assert catalog_file(conn, caches, dest, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM indexer_failures").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
 
 
 def test_s3_key_metadata_overrides_path(tmp_db, tmp_path):
@@ -115,7 +115,7 @@ def test_s3_key_metadata_overrides_path(tmp_db, tmp_path):
         "date=2026-06-02/real.mcap"
     )
     write_minimal_mcap(dest, s3_key=key, channels=[("/a", "S", "ros2msg", 2), ("/z", "S", "ros2msg", 0)])
-    assert index_file(conn, caches, dest, root).status == "indexed"
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
     row = conn.execute(
         "SELECT c.name AS customer, f.date, f.filename FROM files f "
         "JOIN customers c ON c.id = f.customer_id"
@@ -136,17 +136,17 @@ def test_count_mismatch_guard_rolls_back(tmp_db, tmp_path, monkeypatch):
         message_count=999,  # does not match the channel counts below
         channels=[ChannelInfo(1, "/a", "S", "ros2msg", 1)],
     )
-    monkeypatch.setattr(indexer, "read_file_summary", lambda _p: bad)
-    assert index_file(conn, caches, dest, root).status == "failed"
+    monkeypatch.setattr(builder, "read_file_summary", lambda _p: bad)
+    assert catalog_file(conn, caches, dest, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM indexer_failures").fetchone()[0] == 1
+    assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
 
 
 def test_delete_by_path(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
     dest = _write_hive(root)
-    index_file(conn, caches, dest, root)
+    catalog_file(conn, caches, dest, root)
     assert delete_by_path(conn, caches, dest, root) is True
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert delete_by_path(conn, caches, dest, root) is False  # already gone
@@ -154,22 +154,22 @@ def test_delete_by_path(tmp_db, tmp_path):
 
 def test_delete_on_success_clears_prior_failure(tmp_db, tmp_path):
     conn, caches = tmp_db
-    from mcap_indexer.db import record_failure
-    from mcap_indexer.keyparse import relpath_key
+    from mcap_catalog_builder.db import record_failure
+    from mcap_catalog_builder.keyparse import relpath_key
 
     root = str(tmp_path / "watch")
     dest = _write_hive(root)
     key = relpath_key(dest, root)
     record_failure(conn, key, "earlier transient error")
     conn.commit()
-    assert index_file(conn, caches, dest, root).status == "indexed"
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
     assert conn.execute(
-        "SELECT COUNT(*) FROM indexer_failures WHERE s3_key=?", (key,)
+        "SELECT COUNT(*) FROM catalog_failures WHERE s3_key=?", (key,)
     ).fetchone()[0] == 0
 
 
-def test_index_vanished_file_does_not_crash(tmp_db, tmp_path):
-    # A file that disappears mid-reconcile (TOCTOU) must not crash index_file
+def test_catalog_vanished_file_does_not_crash(tmp_db, tmp_path):
+    # A file that disappears mid-reconcile (TOCTOU) must not crash catalog_file
     # nor write a spurious failure row — the deletion sweep cleans up its row.
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
@@ -177,6 +177,6 @@ def test_index_vanished_file_does_not_crash(tmp_db, tmp_path):
         root, "customer=dexory", "customer_site=london", "robot=rob01",
         "source=ros-bags", "date=2026-06-01", "ghost.mcap",
     )
-    assert index_file(conn, caches, missing, root).status == "failed"
+    assert catalog_file(conn, caches, missing, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
-    assert conn.execute("SELECT COUNT(*) FROM indexer_failures").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 0

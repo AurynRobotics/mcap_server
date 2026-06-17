@@ -1,10 +1,10 @@
-"""The indexer core: dimension resolution + the §8 per-file transaction.
+"""The catalog builder core: dimension resolution + the §8 per-file transaction.
 
 Correctness guards (this daemon is the catalog's only writer):
 - dimensions are trusted only if ``rebuild_hive_key(dims) == key`` (round-trip);
 - the ``topic_counts`` blob is built from the sorted topic-set members with a
   ``.get(channel_id, 0)`` default, then an in-transaction check
-  ``sum(counts) == message_count`` rolls a bad row into ``indexer_failures``;
+  ``sum(counts) == message_count`` rolls a bad row into ``catalog_failures``;
 - on rollback the in-memory caches are reloaded from the committed DB state, so
   ids inserted inside the rolled-back transaction can never poison the caches.
 """
@@ -41,8 +41,8 @@ _COMPOSITE = (
 
 
 @dataclass(frozen=True)
-class IndexResult:
-    status: str  # "indexed" | "skipped" | "failed"
+class CatalogResult:
+    status: str  # "cataloged" | "skipped" | "failed"
     detail: str = ""
 
 
@@ -67,7 +67,7 @@ def resolve_dimensions(path: str, watched_root: str) -> tuple[dict[str, str], st
     """Dimensions from the ``s3_key`` metadata, else the relative Hive path.
 
     Returns ``(dims, key)`` only if the key parses AND round-trips exactly;
-    otherwise ``None`` (the caller records an ``indexer_failures`` row).
+    otherwise ``None`` (the caller records an ``catalog_failures`` row).
     """
     key = extract_s3_key(path)
     if key is None:
@@ -92,23 +92,23 @@ def _composite_row(conn, ids, dims):
     ).fetchone()
 
 
-def index_file(
+def catalog_file(
     conn: sqlite3.Connection, caches: Caches, path: str, watched_root: str
-) -> IndexResult:
-    """Index one MCAP file into the catalog (insert or update)."""
+) -> CatalogResult:
+    """Catalog one MCAP file into the catalog (insert or update)."""
     try:
         size, mtime_ns = get_fingerprint(path)
     except OSError as e:
-        # The file vanished (TOCTOU between scan and index) — not a real failure;
+        # The file vanished (TOCTOU between scan and catalog) — not a real failure;
         # the reconcile deletion sweep removes any stale row. Don't crash or record.
-        logger.debug("file vanished before indexing: %s (%s)", path, e)
-        return IndexResult("failed", "file vanished")
+        logger.debug("file vanished before cataloging: %s (%s)", path, e)
+        return CatalogResult("failed", "file vanished")
 
     res = resolve_dimensions(path, watched_root)
     if res is None:
         record_failure(conn, relpath_key(path, watched_root), "unparseable key")
         conn.commit()
-        return IndexResult("failed", "unparseable key")
+        return CatalogResult("failed", "unparseable key")
     dims, key = res
 
     # Resolve dimension ids; commit so the (append-only) lookup rows persist.
@@ -122,7 +122,7 @@ def index_file(
     # Fingerprint-skip (read-only): no file read when (size, mtime) are unchanged.
     existing = _composite_row(conn, ids, dims)
     if existing is not None and existing["size_bytes"] == size and existing["last_modified_ns"] == mtime_ns:
-        return IndexResult("skipped")
+        return CatalogResult("skipped")
 
     # Read the summary OUTSIDE the transaction (slow / can throw).
     try:
@@ -130,7 +130,7 @@ def index_file(
     except Exception as e:  # noqa: BLE001
         record_failure(conn, key, f"{type(e).__name__}: {e}")
         conn.commit()
-        return IndexResult("failed", str(e))
+        return CatalogResult("failed", str(e))
 
     try:
         with conn:  # commit on success, rollback on exception
@@ -158,13 +158,13 @@ def index_file(
 
             conn.execute(
                 "INSERT INTO files("
-                "filename, etag, size_bytes, last_modified_ns, indexed_at_ns, "
+                "filename, etag, size_bytes, last_modified_ns, cataloged_at_ns, "
                 "customer_id, site_id, robot_id, source_id, date, "
                 "start_time_ns, end_time_ns, topic_set_id, topic_counts, has_error) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(customer_id, site_id, robot_id, source_id, date, filename) "
                 "DO UPDATE SET etag=excluded.etag, size_bytes=excluded.size_bytes, "
-                "last_modified_ns=excluded.last_modified_ns, indexed_at_ns=excluded.indexed_at_ns, "
+                "last_modified_ns=excluded.last_modified_ns, cataloged_at_ns=excluded.cataloged_at_ns, "
                 "start_time_ns=excluded.start_time_ns, end_time_ns=excluded.end_time_ns, "
                 "topic_set_id=excluded.topic_set_id, topic_counts=excluded.topic_counts, "
                 "has_error=excluded.has_error",
@@ -189,16 +189,16 @@ def index_file(
             has_error = 1 if any(is_error_tag(k, v) for k, v in tags) else 0
             conn.execute("UPDATE files SET has_error=? WHERE id=?", (has_error, file_id))
 
-            conn.execute("DELETE FROM indexer_failures WHERE s3_key=?", (key,))
+            conn.execute("DELETE FROM catalog_failures WHERE s3_key=?", (key,))
     except Exception as e:  # noqa: BLE001
         # The rolled-back txn may have inserted topics/schemas/sets that are now
         # gone from the DB — reload caches so they can never reference a missing row.
         caches.__dict__.update(load_caches(conn).__dict__)
         record_failure(conn, key, f"{type(e).__name__}: {e}")
         conn.commit()
-        return IndexResult("failed", str(e))
+        return CatalogResult("failed", str(e))
 
-    return IndexResult("indexed")
+    return CatalogResult("cataloged")
 
 
 def delete_by_path(
@@ -223,6 +223,6 @@ def delete_by_path(
         f"DELETE FROM files WHERE {_COMPOSITE}",
         (customer_id, site_id, robot_id, source_id, dims["date"], dims["filename"]),
     )
-    conn.execute("DELETE FROM indexer_failures WHERE s3_key=?", (key,))
+    conn.execute("DELETE FROM catalog_failures WHERE s3_key=?", (key,))
     conn.commit()
     return cur.rowcount > 0

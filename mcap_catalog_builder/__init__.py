@@ -1,4 +1,4 @@
-"""mcap_indexer — local-filesystem MCAP catalog daemon.
+"""mcap_catalog_builder — local-filesystem MCAP catalog daemon.
 
 Watches a folder of `.mcap` recordings and keeps the SQLite catalog
 (see ``schema.sql``) in sync: insert/update on add or modify, hard-delete

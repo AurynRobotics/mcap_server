@@ -12,7 +12,7 @@ from watchdog.events import (
     FileMovedEvent,
 )
 
-from mcap_indexer.watcher import McapEventHandler, WatchEvent, wait_for_stable
+from mcap_catalog_builder.watcher import McapEventHandler, WatchEvent, wait_for_stable
 
 
 def test_debounce_coalesces_modifies():
@@ -21,11 +21,11 @@ def test_debounce_coalesces_modifies():
     for _ in range(5):
         h.on_modified(FileModifiedEvent("/w/a.mcap"))
     time.sleep(0.12)
-    assert q.get(timeout=1) == WatchEvent("index", "/w/a.mcap")
+    assert q.get(timeout=1) == WatchEvent("catalog", "/w/a.mcap")
     assert q.empty()  # five modifies collapsed to one enqueue
 
 
-def test_filters_non_indexable_and_dirs():
+def test_filters_non_catalogable_and_dirs():
     q: queue.Queue = queue.Queue()
     h = McapEventHandler(q, debounce_secs=0.01)
     h.on_modified(FileModifiedEvent("/w/x.txt"))
@@ -43,30 +43,30 @@ def test_on_deleted_enqueues_delete():
     assert q.get_nowait() == WatchEvent("delete", "/w/a.mcap")
 
 
-def test_on_created_indexes_after_debounce():
+def test_on_created_catalogs_after_debounce():
     q: queue.Queue = queue.Queue()
     h = McapEventHandler(q, debounce_secs=0.02)
     h.on_created(FileCreatedEvent("/w/a.mcap"))
     time.sleep(0.06)
-    assert q.get_nowait() == WatchEvent("index", "/w/a.mcap")
+    assert q.get_nowait() == WatchEvent("catalog", "/w/a.mcap")
 
 
-def test_on_moved_tmp_to_final_is_index_only():
+def test_on_moved_tmp_to_final_is_catalog_only():
     q: queue.Queue = queue.Queue()
     h = McapEventHandler(q, debounce_secs=0.02)
     h.on_moved(FileMovedEvent("/w/a.mcap.tmp", "/w/a.mcap"))  # atomic upload rename
     time.sleep(0.06)
-    assert q.get_nowait() == WatchEvent("index", "/w/a.mcap")
-    assert q.empty()  # the .tmp source is not indexable → no delete
+    assert q.get_nowait() == WatchEvent("catalog", "/w/a.mcap")
+    assert q.empty()  # the .tmp source is not catalogable → no delete
 
 
-def test_on_moved_within_tree_is_delete_then_index():
+def test_on_moved_within_tree_is_delete_then_catalog():
     q: queue.Queue = queue.Queue()
     h = McapEventHandler(q, debounce_secs=0.02)
     h.on_moved(FileMovedEvent("/w/a.mcap", "/w/b.mcap"))
     assert q.get_nowait() == WatchEvent("delete", "/w/a.mcap")
     time.sleep(0.06)
-    assert q.get_nowait() == WatchEvent("index", "/w/b.mcap")
+    assert q.get_nowait() == WatchEvent("catalog", "/w/b.mcap")
 
 
 def test_cancel_timers_prevents_enqueue():
@@ -99,11 +99,11 @@ def test_wait_for_stable_false_when_missing(monkeypatch):
     assert wait_for_stable("x", interval=0.0, checks=3) is False
 
 
-def test_on_deleted_cancels_pending_index_timer():
+def test_on_deleted_cancels_pending_catalog_timer():
     q: queue.Queue = queue.Queue()
     h = McapEventHandler(q, debounce_secs=0.1)
-    h.on_created(FileCreatedEvent("/w/a.mcap"))  # schedules an index timer
+    h.on_created(FileCreatedEvent("/w/a.mcap"))  # schedules an catalog timer
     h.on_deleted(FileDeletedEvent("/w/a.mcap"))  # must cancel it + enqueue delete
     assert q.get_nowait() == WatchEvent("delete", "/w/a.mcap")
     time.sleep(0.15)
-    assert q.empty()  # the index timer was cancelled → no stale index event
+    assert q.empty()  # the catalog timer was cancelled → no stale catalog event

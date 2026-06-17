@@ -5,7 +5,7 @@ The object key is a Hive-partitioned path::
     customer=<c>/customer_site=<site>/robot=<r>/source=<s>/date=<d>/<filename>.mcap
 
 Note the path literal is ``customer_site=`` but the parsed field is ``site``.
-``rebuild_hive_key`` is the exact inverse of ``parse_hive_key`` so the indexer
+``rebuild_hive_key`` is the exact inverse of ``parse_hive_key`` so the catalog builder
 can verify ``rebuild_hive_key(dims) == key.lstrip('/')`` before trusting a parse.
 """
 

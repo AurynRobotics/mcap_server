@@ -1,7 +1,7 @@
-# mcap_server — Catalog & Indexer: Requirements
+# mcap_server — Catalog & Builder: Requirements
 
 Plain and intentionally lightweight for now. The executable schema in
-[`mcap_indexer/schema.sql`](mcap_indexer/schema.sql) is the source of truth for
+[`mcap_catalog_builder/schema.sql`](mcap_catalog_builder/schema.sql) is the source of truth for
 table structure; this file is the *why* and the *what*. Requirements are numbered
 (`R1`…) so they can be cited.
 
@@ -9,7 +9,7 @@ table structure; this file is the *why* and the *what*. Requirements are numbere
 
 1. MCAP recordings are **uploaded to the server** (today: a watched folder;
    later: an S3/GCS bucket).
-2. The **indexer** detects each new / changed / removed file and keeps a
+2. The **catalog builder** detects each new / changed / removed file and keeps a
    **SQLite catalog** in sync. It is the *single writer*.
 3. A **query / data server** (likely Go — not decided yet) reads that same
    catalog and serves clients.
@@ -47,25 +47,25 @@ Metadata *about* recordings — never the recorded messages:
 - **Inspect one recording** (its signals, counts, time span, tags) with no file
   read.
 - List recordings that **failed validation**, and — separately — files that
-  **could not be indexed** at all.
+  **could not be cataloged** at all.
 - Filter by a **numeric threshold on a signal** (e.g. *velocity > X*) — answered
   from **cached per-signal aggregates**, not by reading files at query time
   (*planned*; see R11–R13).
 
 ## Requirements
 
-**Indexer**
+**Catalog builder**
 - **R1** — Single writer to the catalog; readers (the query server) run
   concurrently (SQLite WAL).
-- **R2** — To index a file, read **only its MCAP summary/footer** (a few KB) plus
+- **R2** — To catalog a file, read **only its MCAP summary/footer** (a few KB) plus
   the path — never the whole file.
 - **R3** — Derive labels from the file's Hive-partitioned key; trust the parse
   only if it **round-trips** back to the original key, else log a failure (keep
   the raw key, skip the file) — never guess a wrong row.
 - **R4** — Detect change with a cheap **fingerprint from the listing** (S3 ETag /
   GCS generation; locally `size + mtime`). Unchanged → skip with no read; a
-  restart over an indexed lake re-reads **zero** files.
-- **R5** — Keep the catalog in sync: **insert** new, **re-index** changed,
+  restart over an cataloged lake re-reads **zero** files.
+- **R5** — Keep the catalog in sync: **insert** new, **re-catalog** changed,
   **hard-delete** vanished; **reconcile** on startup. Each file's update is one
   transaction.
 
@@ -83,13 +83,13 @@ Metadata *about* recordings — never the recorded messages:
 - **R10** — A filtered page costs the same at 100 files or 8,000,000 (pre-built
   index + paginated seek → single-digit ms). Catalog size tracks file *count*,
   not bytes (~0.7 GB per 1M files, thanks to R7). The cost that scales with the
-  lake is the **cold index build**, not queries — the main lever there is
-  indexing files in parallel (not done yet).
+  lake is the **cold catalog build**, not queries — the main lever there is
+  cataloging files in parallel (not done yet).
 
 **Derived metrics (planned — schema forward-declared, not yet populated)**
 - **R11** — Expensive, payload-derived facts (per-signal `min`/`max`/`mean`/
   percentiles) are computed **once** by a separate **content-aware** pass —
-  distinct from the metadata indexer, which never reads payloads (R2) — and cached
+  distinct from the metadata catalog builder, which never reads payloads (R2) — and cached
   in `file_metrics`. A threshold query (*signal > X*) is then a fast catalog
   range-scan for **any** X, never a re-read. Cache the **scalar** (e.g. the max),
   not the boolean answer to one X.
@@ -109,17 +109,17 @@ Metadata *about* recordings — never the recorded messages:
 
 - The **streaming / download** path (reading chunks, filtering to the selected
   topics/time, compressing, resume).
-- The **S3/GCS backend** — the indexer is local-filesystem today; the schema and
+- The **S3/GCS backend** — the catalog builder is local-filesystem today; the schema and
   fingerprint requirements are already storage-agnostic.
-- **Human-edited tags** that survive a re-index.
-- **Parallel** indexing.
+- **Human-edited tags** that survive a re-catalog.
+- **Parallel** cataloging.
 - The **metric-extraction pass** that populates `file_metrics` (R11–R13): the
   tables are forward-declared in `schema.sql`, but nothing writes them yet.
 
 ## See also
 
-- [`mcap_indexer/`](mcap_indexer/) — the running indexer + tests.
-- [`mcap_indexer/schema.sql`](mcap_indexer/schema.sql) — the executable catalog
+- [`mcap_catalog_builder/`](mcap_catalog_builder/) — the running catalog builder + tests.
+- [`mcap_catalog_builder/schema.sql`](mcap_catalog_builder/schema.sql) — the executable catalog
   schema (source of truth for tables).
-- [`mcap_indexer/README.md`](mcap_indexer/README.md) — the daemon's CLI and
+- [`mcap_catalog_builder/README.md`](mcap_catalog_builder/README.md) — the daemon's CLI and
   behavior.

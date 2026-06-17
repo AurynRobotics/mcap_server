@@ -1,4 +1,4 @@
-"""Full reconcile scan: index every on-disk file, then hard-delete vanished rows.
+"""Full reconcile scan: catalog every on-disk file, then hard-delete vanished rows.
 
 This is the authoritative path for removals (live ``on_deleted`` events are
 best-effort). It runs on the single writer thread like everything else.
@@ -11,12 +11,12 @@ from pathlib import Path
 import sqlite3
 
 from .db import Caches
-from .indexer import index_file, resolve_dimensions
+from .builder import catalog_file, resolve_dimensions
 
 logger = logging.getLogger(__name__)
 
 
-def _is_indexable_name(name: str) -> bool:
+def _is_catalogable_name(name: str) -> bool:
     return (
         name.endswith(".mcap")
         and not name.startswith(".")
@@ -26,7 +26,7 @@ def _is_indexable_name(name: str) -> bool:
 
 
 def scan_disk(watched_root: str) -> list[str]:
-    """Return sorted absolute paths of indexable ``.mcap`` files under ``watched_root``.
+    """Return sorted absolute paths of catalogable ``.mcap`` files under ``watched_root``.
 
     Skips dotfiles, any path with a hidden directory component, and ``*.mcap.tmp`` /
     ``*.part`` temp files.
@@ -37,7 +37,7 @@ def scan_disk(watched_root: str) -> list[str]:
         rel_parts = p.relative_to(root).parts
         if any(part.startswith(".") for part in rel_parts):
             continue
-        if _is_indexable_name(p.name):
+        if _is_catalogable_name(p.name):
             out.append(str(p))
     return sorted(out)
 
@@ -45,14 +45,14 @@ def scan_disk(watched_root: str) -> list[str]:
 def full_reconcile(
     conn: sqlite3.Connection, caches: Caches, watched_root: str
 ) -> dict[str, int]:
-    """Index all on-disk files, then delete catalog rows with no on-disk file.
+    """Catalog all on-disk files, then delete catalog rows with no on-disk file.
 
-    Returns a tally ``{"indexed", "skipped", "failed", "deleted"}``.
+    Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
     """
-    tally = {"indexed": 0, "skipped": 0, "failed": 0, "deleted": 0}
+    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
     paths = scan_disk(watched_root)
     for path in paths:
-        tally[index_file(conn, caches, path, watched_root).status] += 1
+        tally[catalog_file(conn, caches, path, watched_root).status] += 1
 
     # Deletion sweep: composite keys present on disk (parseable + cached ids).
     present: set[tuple] = set()
@@ -82,7 +82,7 @@ def full_reconcile(
     conn.commit()
 
     logger.info(
-        "reconcile %s: indexed=%d skipped=%d failed=%d deleted=%d",
-        watched_root, tally["indexed"], tally["skipped"], tally["failed"], tally["deleted"],
+        "reconcile %s: cataloged=%d skipped=%d failed=%d deleted=%d",
+        watched_root, tally["cataloged"], tally["skipped"], tally["failed"], tally["deleted"],
     )
     return tally

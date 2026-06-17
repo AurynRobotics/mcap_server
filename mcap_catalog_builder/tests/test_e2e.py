@@ -6,15 +6,15 @@ other two are synthetic and always run.
 
 import os
 
-from mcap_indexer.db import load_caches, open_db
-from mcap_indexer.reconcile import full_reconcile
-from mcap_indexer.tests.fixtures import (
+from mcap_catalog_builder.db import load_caches, open_db
+from mcap_catalog_builder.reconcile import full_reconcile
+from mcap_catalog_builder.tests.fixtures import (
     dexory_file,
     make_hive_fixture,
     write_flat_no_metadata,
     write_minimal_mcap,
 )
-from mcap_indexer.varint import decode_counts_blob
+from mcap_catalog_builder.varint import decode_counts_blob
 
 F197 = "197_continuous_2026_06_01-04_43_33.mcap"
 F198 = "198_continuous_2026_06_01-05_03_33.mcap"
@@ -44,7 +44,7 @@ def test_e2e_reconcile(tmp_path):
         assert row["end_time_ns"] == 1780290213410240515
         assert row["has_error"] == 0
         assert row["etag"] == f"local:{row['size_bytes']}:{row['last_modified_ns']}"
-        assert row["indexed_at_ns"] > row["last_modified_ns"]
+        assert row["cataloged_at_ns"] > row["last_modified_ns"]
 
         n_members = conn.execute(
             "SELECT COUNT(*) FROM topic_set_members WHERE set_id=?", (row["topic_set_id"],)
@@ -56,7 +56,7 @@ def test_e2e_reconcile(tmp_path):
 
         # warm no-op
         tally = full_reconcile(conn, caches, watch)
-        assert tally["indexed"] == 0 and tally["skipped"] == 1
+        assert tally["cataloged"] == 0 and tally["skipped"] == 1
         assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
 
         # add 198 → 2 files, 1 topic set (identical layout → deduped)
@@ -65,11 +65,11 @@ def test_e2e_reconcile(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
         assert conn.execute("SELECT COUNT(*) FROM topic_sets").fetchone()[0] == 1
 
-        # modify (touch mtime) → reindex, still 2 rows
+        # modify (touch mtime) → recatalog, still 2 rows
         st = os.stat(dest198)
         os.utime(dest198, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
         tally = full_reconcile(conn, caches, watch)
-        assert tally["indexed"] >= 1
+        assert tally["cataloged"] >= 1
         assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
 
         # remove 197 → hard-delete, topic set survives
@@ -91,7 +91,7 @@ def test_e2e_failure_path(tmp_path):
     caches = load_caches(conn)
     try:
         full_reconcile(conn, caches, watch)
-        assert conn.execute("SELECT COUNT(*) FROM indexer_failures").fetchone()[0] >= 1
+        assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] >= 1
         assert conn.execute(
             "SELECT COUNT(*) FROM files WHERE filename='bad.mcap'"
         ).fetchone()[0] == 0

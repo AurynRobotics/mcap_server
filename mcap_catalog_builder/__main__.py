@@ -1,4 +1,4 @@
-"""CLI entry point: ``python3 -m mcap_indexer <watch_root> [options]``.
+"""CLI entry point: ``python3 -m mcap_catalog_builder <watch_root> [options]``.
 
 Architecture: the watchdog observer, the debounce Timers, and the periodic
 rescan thread are PRODUCERS — they only enqueue WatchEvents. ``worker_loop`` (run
@@ -14,7 +14,7 @@ import sqlite3
 import threading
 
 from .db import Caches, load_caches, open_db
-from .indexer import delete_by_path, index_file
+from .builder import delete_by_path, catalog_file
 from .reconcile import full_reconcile
 from .watcher import McapEventHandler, WatchEvent, start_observer, wait_for_stable
 
@@ -26,7 +26,7 @@ DEFAULT_DB = "/tmp/pj-cloud-catalog.db"
 def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     p = argparse.ArgumentParser(
-        prog="mcap_indexer",
+        prog="mcap_catalog_builder",
         description="Watch a folder of .mcap files and keep the SQLite catalog in sync.",
     )
     p.add_argument("watch_root", help="folder of .mcap recordings to watch")
@@ -36,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--debounce", type=float, default=2.0,
                    help="seconds to debounce file events (default: 2)")
     p.add_argument("--stability-checks", type=int, default=3,
-                   help="size-stability poll count before indexing (default: 3)")
+                   help="size-stability poll count before cataloging (default: 3)")
     p.add_argument("--stability-interval", type=float, default=0.5,
                    help="seconds between size-stability polls (default: 0.5)")
     p.add_argument("--log-level", default="INFO",
@@ -61,9 +61,9 @@ def worker_loop(
         try:
             if ev.kind == "stop":
                 break
-            if ev.kind == "index":
+            if ev.kind == "catalog":
                 if wait_for_stable(ev.path, stability_interval, stability_checks):
-                    index_file(conn, caches, ev.path, watched_root)
+                    catalog_file(conn, caches, ev.path, watched_root)
                 else:
                     logger.warning("file not stable, dropping (retries on rescan): %s", ev.path)
             elif ev.kind == "delete":

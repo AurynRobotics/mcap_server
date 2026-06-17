@@ -1,6 +1,6 @@
-"""Shared pytest setup for mcap_indexer tests.
+"""Shared pytest setup for mcap_catalog_builder tests.
 
-Inserts the repo root onto ``sys.path`` so ``from mcap_indexer import ...`` works
+Inserts the repo root onto ``sys.path`` so ``from mcap_catalog_builder import ...`` works
 regardless of the invoking cwd. The ``tmp_db`` fixture is added in Task 10.
 """
 
@@ -13,7 +13,7 @@ if _REPO_ROOT not in sys.path:
 
 import pytest  # noqa: E402
 
-from mcap_indexer.db import load_caches, open_db  # noqa: E402
+from mcap_catalog_builder.db import load_caches, open_db  # noqa: E402
 
 
 @pytest.fixture

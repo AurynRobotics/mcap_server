@@ -1,4 +1,4 @@
--- mcap_indexer catalog schema (browse & filter).
+-- mcap_catalog_builder catalog schema (browse & filter).
 --
 -- Verbatim copy of §3 of 2026-06-15-catalog-sqlite-schema.md, made idempotent
 -- with CREATE TABLE/INDEX IF NOT EXISTS so executescript() is re-runnable.
@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS files (
     etag              TEXT    NOT NULL,            -- S3 ETag / GCS generation; locally synthesized
     size_bytes        INTEGER NOT NULL,
     last_modified_ns  INTEGER NOT NULL,
-    indexed_at_ns     INTEGER NOT NULL,
+    cataloged_at_ns     INTEGER NOT NULL,
 
     -- Path-derived dimensions, as FK ids into the lookup tables below.
     customer_id       INTEGER NOT NULL REFERENCES customers(id),
@@ -109,8 +109,8 @@ CREATE TABLE IF NOT EXISTS tags (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_tags_kv ON tags(key, value);
 
--- indexer_failures: files we COULD NOT index (keeps the raw key).
-CREATE TABLE IF NOT EXISTS indexer_failures (
+-- catalog_failures: files we COULD NOT catalog (keeps the raw key).
+CREATE TABLE IF NOT EXISTS catalog_failures (
     s3_key       TEXT    NOT NULL PRIMARY KEY,
     failed_at_ns INTEGER NOT NULL,
     error_text   TEXT    NOT NULL
@@ -119,12 +119,12 @@ CREATE TABLE IF NOT EXISTS indexer_failures (
 -- ─────────────────────────────────────────────────────────────────────────────
 -- PLANNED — NOT YET POPULATED: derived per-signal metrics (REQUIREMENTS.md R11-R13).
 --
--- A separate, content-aware extraction pass — distinct from the metadata indexer,
+-- A separate, content-aware extraction pass — distinct from the metadata catalog builder,
 -- which never reads payloads (R2) — reads the ~10% of files carrying queryable
 -- numeric data and caches per-signal aggregates here, so a threshold query
 -- ("signal > X") is answered from the catalog for ANY X without re-reading files.
 -- These tables are forward-declared so the query server can build against them;
--- the current indexer writes to NEITHER of them.
+-- the current catalog builder writes to NEITHER of them.
 
 -- file_metrics: cached per-(file, signal, field) aggregates.
 CREATE TABLE IF NOT EXISTS file_metrics (
@@ -136,7 +136,7 @@ CREATE TABLE IF NOT EXISTS file_metrics (
     etag     TEXT    NOT NULL,          -- file fingerprint these were computed for (R12)
     PRIMARY KEY (file_id, topic_id, field, stat)
 ) WITHOUT ROWID;
--- Drives "signal > X" as an indexed range scan. Paginate this query class by
+-- Drives "signal > X" as an cataloged range scan. Paginate this query class by
 -- `value` (the cursor that matches this index), NOT by files.id — a files.id
 -- cursor would force a sort over the whole match set (measured: 55x slower).
 CREATE INDEX IF NOT EXISTS idx_metrics_q ON file_metrics(topic_id, field, stat, value);

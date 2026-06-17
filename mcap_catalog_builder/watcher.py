@@ -3,8 +3,8 @@
 The handler NEVER touches the database — it only ``queue.put(...)`` WatchEvents.
 The single worker thread drains the queue and does all DB writes. Per-path
 debounce Timers (daemon threads) collapse a burst of modify events into one
-index, and ``wait_for_stable`` (run by the worker, not the handler) guards
-against indexing a file that is still being copied.
+catalog operation, and ``wait_for_stable`` (run by the worker, not the handler) guards
+against cataloging a file that is still being copied.
 """
 
 import logging
@@ -22,11 +22,11 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class WatchEvent:
-    kind: str  # "index" | "delete" | "rescan" | "stop"
+    kind: str  # "catalog" | "delete" | "rescan" | "stop"
     path: str | None = None
 
 
-def _is_indexable(path: str) -> bool:
+def _is_catalogable(path: str) -> bool:
     name = os.path.basename(path)
     return (
         name.endswith(".mcap")
@@ -45,32 +45,32 @@ class McapEventHandler(FileSystemEventHandler):
         self._timers: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
 
-    def _schedule_index(self, path: str) -> None:
+    def _schedule_catalog(self, path: str) -> None:
         with self._lock:
             existing = self._timers.pop(path, None)
             if existing is not None:
                 existing.cancel()
-            timer = threading.Timer(self._debounce, self._fire_index, args=(path,))
+            timer = threading.Timer(self._debounce, self._fire_catalog, args=(path,))
             timer.daemon = True
             self._timers[path] = timer
             timer.start()
 
-    def _fire_index(self, path: str) -> None:
+    def _fire_catalog(self, path: str) -> None:
         with self._lock:
             self._timers.pop(path, None)
-        self._q.put(WatchEvent("index", path))
+        self._q.put(WatchEvent("catalog", path))
 
     def on_created(self, event) -> None:
-        if not event.is_directory and _is_indexable(event.src_path):
-            self._schedule_index(event.src_path)
+        if not event.is_directory and _is_catalogable(event.src_path):
+            self._schedule_catalog(event.src_path)
 
     def on_modified(self, event) -> None:
-        if not event.is_directory and _is_indexable(event.src_path):
-            self._schedule_index(event.src_path)
+        if not event.is_directory and _is_catalogable(event.src_path):
+            self._schedule_catalog(event.src_path)
 
     def on_deleted(self, event) -> None:
-        if not event.is_directory and _is_indexable(event.src_path):
-            with self._lock:  # cancel a pending index timer for this now-gone path
+        if not event.is_directory and _is_catalogable(event.src_path):
+            with self._lock:  # cancel a pending catalog timer for this now-gone path
                 timer = self._timers.pop(event.src_path, None)
                 if timer is not None:
                     timer.cancel()
@@ -79,10 +79,10 @@ class McapEventHandler(FileSystemEventHandler):
     def on_moved(self, event) -> None:
         if event.is_directory:
             return
-        if _is_indexable(event.src_path):
+        if _is_catalogable(event.src_path):
             self._q.put(WatchEvent("delete", event.src_path))
-        if _is_indexable(event.dest_path):
-            self._schedule_index(event.dest_path)
+        if _is_catalogable(event.dest_path):
+            self._schedule_catalog(event.dest_path)
 
     def cancel_timers(self) -> None:
         with self._lock:

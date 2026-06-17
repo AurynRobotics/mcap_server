@@ -1,7 +1,7 @@
 """Tests for MCAP summary extraction + s3_key metadata reading."""
 
-from mcap_indexer.mcap_summary import derive_tags, extract_s3_key, read_file_summary
-from mcap_indexer.tests.fixtures import dexory_file, write_minimal_mcap
+from mcap_catalog_builder.mcap_summary import derive_tags, extract_s3_key, read_file_summary
+from mcap_catalog_builder.tests.fixtures import dexory_file, write_minimal_mcap
 
 
 def test_zero_count_channel_present_with_zero(tmp_path):

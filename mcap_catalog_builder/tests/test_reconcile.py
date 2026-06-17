@@ -1,9 +1,9 @@
-"""Tests for the full reconcile scan: index, dedup, warm no-op, deletion sweep."""
+"""Tests for the full reconcile scan: catalog, dedup, warm no-op, deletion sweep."""
 
 import os
 
-from mcap_indexer.reconcile import full_reconcile, scan_disk
-from mcap_indexer.tests.fixtures import write_minimal_mcap
+from mcap_catalog_builder.reconcile import full_reconcile, scan_disk
+from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 
 CH = [("/a", "S", "ros2msg", 2), ("/b", "S", "ros2msg", 1), ("/zero", "S", "ros2msg", 0)]
 
@@ -34,13 +34,13 @@ def test_scan_disk_filters_temp_and_hidden(tmp_path):
     assert [os.path.basename(p) for p in scan_disk(root)] == ["good.mcap"]
 
 
-def test_reconcile_indexes_and_dedups(tmp_db, tmp_path):
+def test_reconcile_catalogs_and_dedups(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
     _hive(root, filename="a.mcap")
     _hive(root, filename="b.mcap")  # same channel layout → one topic set
     tally = full_reconcile(conn, caches, root)
-    assert tally["indexed"] == 2
+    assert tally["cataloged"] == 2
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
     assert conn.execute("SELECT COUNT(*) FROM topic_sets").fetchone()[0] == 1
 
@@ -51,7 +51,7 @@ def test_reconcile_warm_noop(tmp_db, tmp_path):
     _hive(root, filename="a.mcap")
     full_reconcile(conn, caches, root)
     tally = full_reconcile(conn, caches, root)
-    assert tally["indexed"] == 0 and tally["skipped"] == 1
+    assert tally["cataloged"] == 0 and tally["skipped"] == 1
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
 
 
