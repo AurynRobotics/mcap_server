@@ -1,0 +1,163 @@
+"""SQLite connection, schema init, in-memory id caches, and id resolvers.
+
+The daemon is the single writer; all DB access is serialized through one worker
+thread draining a queue, so ``check_same_thread=False`` is safe here (the
+connection is created on the main thread but used from the worker).
+
+Resolvers use ``INSERT OR IGNORE`` then ``SELECT id`` (never ``lastrowid`` after
+``OR IGNORE``), and do NOT commit — the caller owns the transaction.
+"""
+
+import logging
+import sqlite3
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+
+
+def open_db(path: str) -> sqlite3.Connection:
+    """Open (creating/upgrading) the catalog DB with WAL + FK + busy_timeout."""
+    # isolation_level="" pins legacy deferred-transaction control, so `with conn:`
+    # reliably commits on success / rolls back on exception across Python versions.
+    conn = sqlite3.connect(path, check_same_thread=False, isolation_level="")
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.executescript(_SCHEMA_PATH.read_text())
+    conn.commit()
+    return conn
+
+
+def now_ns() -> int:
+    return time.time_ns()
+
+
+@dataclass
+class Caches:
+    customer: dict[str, int] = field(default_factory=dict)
+    site: dict[tuple[int, str], int] = field(default_factory=dict)    # (customer_id, name) -> id
+    robot: dict[tuple[int, str], int] = field(default_factory=dict)   # (site_id, name) -> id
+    source: dict[str, int] = field(default_factory=dict)
+    topic: dict[str, int] = field(default_factory=dict)
+    schema: dict[tuple[str, str], int] = field(default_factory=dict)  # (name, encoding) -> id
+    topic_set: dict[str, int] = field(default_factory=dict)           # fingerprint -> id
+
+
+def load_caches(conn: sqlite3.Connection) -> Caches:
+    """Populate all in-memory caches from the current DB contents."""
+    c = Caches()
+    for r in conn.execute("SELECT id, name FROM customers"):
+        c.customer[r["name"]] = r["id"]
+    for r in conn.execute("SELECT id, customer_id, name FROM sites"):
+        c.site[(r["customer_id"], r["name"])] = r["id"]
+    for r in conn.execute("SELECT id, site_id, name FROM robots"):
+        c.robot[(r["site_id"], r["name"])] = r["id"]
+    for r in conn.execute("SELECT id, name FROM sources"):
+        c.source[r["name"]] = r["id"]
+    for r in conn.execute("SELECT id, name FROM topic_names"):
+        c.topic[r["name"]] = r["id"]
+    for r in conn.execute("SELECT id, name, encoding FROM schemas"):
+        c.schema[(r["name"], r["encoding"])] = r["id"]
+    for r in conn.execute("SELECT id, fingerprint FROM topic_sets"):
+        c.topic_set[r["fingerprint"]] = r["id"]
+    return c
+
+
+def _resolve_named(conn, cache, table, name) -> int:
+    if name in cache:
+        return cache[name]
+    conn.execute(f"INSERT OR IGNORE INTO {table}(name) VALUES (?)", (name,))
+    cache[name] = conn.execute(f"SELECT id FROM {table} WHERE name = ?", (name,)).fetchone()["id"]
+    return cache[name]
+
+
+def resolve_customer(conn, caches: Caches, name: str) -> int:
+    return _resolve_named(conn, caches.customer, "customers", name)
+
+
+def resolve_source(conn, caches: Caches, name: str) -> int:
+    return _resolve_named(conn, caches.source, "sources", name)
+
+
+def resolve_topic(conn, caches: Caches, name: str) -> int:
+    return _resolve_named(conn, caches.topic, "topic_names", name)
+
+
+def resolve_site(conn, caches: Caches, customer_id: int, name: str) -> int:
+    key = (customer_id, name)
+    if key in caches.site:
+        return caches.site[key]
+    conn.execute(
+        "INSERT OR IGNORE INTO sites(customer_id, name) VALUES (?, ?)", (customer_id, name)
+    )
+    caches.site[key] = conn.execute(
+        "SELECT id FROM sites WHERE customer_id=? AND name=?", (customer_id, name)
+    ).fetchone()["id"]
+    return caches.site[key]
+
+
+def resolve_robot(conn, caches: Caches, site_id: int, name: str) -> int:
+    key = (site_id, name)
+    if key in caches.robot:
+        return caches.robot[key]
+    conn.execute("INSERT OR IGNORE INTO robots(site_id, name) VALUES (?, ?)", (site_id, name))
+    caches.robot[key] = conn.execute(
+        "SELECT id FROM robots WHERE site_id=? AND name=?", (site_id, name)
+    ).fetchone()["id"]
+    return caches.robot[key]
+
+
+def resolve_schema(conn, caches: Caches, name: str, encoding: str) -> int:
+    key = (name, encoding)
+    if key in caches.schema:
+        return caches.schema[key]
+    conn.execute("INSERT OR IGNORE INTO schemas(name, encoding) VALUES (?, ?)", (name, encoding))
+    caches.schema[key] = conn.execute(
+        "SELECT id FROM schemas WHERE name=? AND encoding=?", (name, encoding)
+    ).fetchone()["id"]
+    return caches.schema[key]
+
+
+def resolve_topic_set(
+    conn, caches: Caches, fingerprint: str, members: list[tuple[int, int]]
+) -> int:
+    """Resolve a topic set by fingerprint; insert its members only on first insert.
+
+    ``members`` must already be sorted by ``topic_id`` ASC (the counts blob is
+    aligned to this order).
+    """
+    if fingerprint in caches.topic_set:
+        return caches.topic_set[fingerprint]
+    row = conn.execute(
+        "SELECT id FROM topic_sets WHERE fingerprint = ?", (fingerprint,)
+    ).fetchone()
+    if row is not None:
+        caches.topic_set[fingerprint] = row["id"]
+        return row["id"]
+    if list(members) != sorted(members):
+        raise ValueError("topic_set members must be sorted by topic_id ASC")
+    conn.execute("INSERT INTO topic_sets(fingerprint) VALUES (?)", (fingerprint,))
+    set_id = conn.execute(
+        "SELECT id FROM topic_sets WHERE fingerprint = ?", (fingerprint,)
+    ).fetchone()["id"]
+    conn.executemany(
+        "INSERT INTO topic_set_members(set_id, topic_id, schema_id) VALUES (?, ?, ?)",
+        [(set_id, tid, sid) for tid, sid in members],
+    )
+    caches.topic_set[fingerprint] = set_id
+    return set_id
+
+
+def record_failure(conn, key: str, error_text: str) -> None:
+    """Upsert an ``indexer_failures`` row (keyed by the raw object key)."""
+    conn.execute(
+        "INSERT INTO indexer_failures(s3_key, failed_at_ns, error_text) VALUES (?, ?, ?) "
+        "ON CONFLICT(s3_key) DO UPDATE SET "
+        "failed_at_ns=excluded.failed_at_ns, error_text=excluded.error_text",
+        (key, now_ns(), error_text),
+    )

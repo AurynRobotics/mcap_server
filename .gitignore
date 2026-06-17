@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Catalog artifacts (regenerable; default lives at /tmp anyway)
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor
+.DS_Store
