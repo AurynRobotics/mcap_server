@@ -45,7 +45,12 @@ CREATE TABLE IF NOT EXISTS files (
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_time  ON files(start_time_ns, end_time_ns);
+-- idx_files_error: global "list ALL files that failed validation", ordered by id.
 CREATE INDEX IF NOT EXISTS idx_files_error ON files(id) WHERE has_error = 1;
+-- idx_files_cust_err: customer/site-SCOPED error queries (keyset-native, no sort).
+-- Complements idx_files_error, which would otherwise force a scan across all
+-- customers' errors for a scoped query (measured: 8.8 ms -> 0.066 ms at 1M files).
+CREATE INDEX IF NOT EXISTS idx_files_cust_err ON files(customer_id, site_id, id) WHERE has_error = 1;
 CREATE INDEX IF NOT EXISTS idx_files_set   ON files(topic_set_id, id);
 
 -- Dimension lookups (hierarchical: site→customer, robot→site; sources flat).
@@ -110,3 +115,36 @@ CREATE TABLE IF NOT EXISTS indexer_failures (
     failed_at_ns INTEGER NOT NULL,
     error_text   TEXT    NOT NULL
 );
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- PLANNED — NOT YET POPULATED: derived per-signal metrics (REQUIREMENTS.md R11-R13).
+--
+-- A separate, content-aware extraction pass — distinct from the metadata indexer,
+-- which never reads payloads (R2) — reads the ~10% of files carrying queryable
+-- numeric data and caches per-signal aggregates here, so a threshold query
+-- ("signal > X") is answered from the catalog for ANY X without re-reading files.
+-- These tables are forward-declared so the query server can build against them;
+-- the current indexer writes to NEITHER of them.
+
+-- file_metrics: cached per-(file, signal, field) aggregates.
+CREATE TABLE IF NOT EXISTS file_metrics (
+    file_id  INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    topic_id INTEGER NOT NULL REFERENCES topic_names(id),
+    field    TEXT    NOT NULL,          -- numeric field path, e.g. 'linear.x'
+    stat     TEXT    NOT NULL,          -- 'min' | 'max' | 'mean' | 'p99' | ...
+    value    REAL    NOT NULL,
+    etag     TEXT    NOT NULL,          -- file fingerprint these were computed for (R12)
+    PRIMARY KEY (file_id, topic_id, field, stat)
+) WITHOUT ROWID;
+-- Drives "signal > X" as an indexed range scan. Paginate this query class by
+-- `value` (the cursor that matches this index), NOT by files.id — a files.id
+-- cursor would force a sort over the whole match set (measured: 55x slower).
+CREATE INDEX IF NOT EXISTS idx_metrics_q ON file_metrics(topic_id, field, stat, value);
+
+-- file_metric_status: per-file extraction bookkeeping — skip the ~90% with no
+-- numeric data, recompute the rest only when the fingerprint changes (R13).
+CREATE TABLE IF NOT EXISTS file_metric_status (
+    file_id           INTEGER NOT NULL PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+    has_numeric       INTEGER NOT NULL,  -- 0/1: does this file carry queryable numeric data
+    computed_for_etag TEXT               -- fingerprint metrics were last computed for; NULL = pending
+) WITHOUT ROWID;

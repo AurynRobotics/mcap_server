@@ -63,7 +63,7 @@ routes any mismatch to `indexer_failures` — making a wrong count impossible to
 ## Tests
 
 ```bash
-cd /home/davide/ws_plotjuggler/mcap_server
+cd /home/davide/ws_plotjuggler/auryn-mcap-server
 python3 -m compileall mcap_indexer
 python3 -m pytest mcap_indexer/tests/ -v
 ```

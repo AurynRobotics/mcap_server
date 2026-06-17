@@ -48,6 +48,9 @@ Metadata *about* recordings — never the recorded messages:
   read.
 - List recordings that **failed validation**, and — separately — files that
   **could not be indexed** at all.
+- Filter by a **numeric threshold on a signal** (e.g. *velocity > X*) — answered
+  from **cached per-signal aggregates**, not by reading files at query time
+  (*planned*; see R11–R13).
 
 ## Requirements
 
@@ -83,6 +86,25 @@ Metadata *about* recordings — never the recorded messages:
   lake is the **cold index build**, not queries — the main lever there is
   indexing files in parallel (not done yet).
 
+**Derived metrics (planned — schema forward-declared, not yet populated)**
+- **R11** — Expensive, payload-derived facts (per-signal `min`/`max`/`mean`/
+  percentiles) are computed **once** by a separate **content-aware** pass —
+  distinct from the metadata indexer, which never reads payloads (R2) — and cached
+  in `file_metrics`. A threshold query (*signal > X*) is then a fast catalog
+  range-scan for **any** X, never a re-read. Cache the **scalar** (e.g. the max),
+  not the boolean answer to one X.
+- **R12** — A cached metric is valid only for the exact file content it was
+  computed from: every row is stamped with the same change fingerprint (`etag`,
+  R4) and is stale the moment that changes (`ON DELETE CASCADE` drops metrics with
+  the file).
+- **R13** — Extraction is **asynchronous and off the query path** (R9's "fast
+  query, never a scan" still holds): client queries only **read** cached metrics;
+  a query against an un-computed metric reports *pending*, it never triggers a
+  scan. The ~90% of files with no queryable numeric data are detected once
+  (largely from the schema definitions already in the summary) and flagged in
+  `file_metric_status`, so they are never re-scanned; the ~10% are recomputed only
+  when their fingerprint changes.
+
 ## Not in scope yet
 
 - The **streaming / download** path (reading chunks, filtering to the selected
@@ -91,6 +113,8 @@ Metadata *about* recordings — never the recorded messages:
   fingerprint requirements are already storage-agnostic.
 - **Human-edited tags** that survive a re-index.
 - **Parallel** indexing.
+- The **metric-extraction pass** that populates `file_metrics` (R11–R13): the
+  tables are forward-declared in `schema.sql`, but nothing writes them yet.
 
 ## See also
 
