@@ -18,6 +18,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, Iterator, Protocol
 
+from .mcap_summary import extract_s3_key
+from .watcher import wait_for_stable
+
 
 @dataclass(frozen=True)
 class Stat:
@@ -25,6 +28,7 @@ class Stat:
 
     size: int
     etag: str  # the change token (R4): the real S3 ETag, or a synthetic local one
+    mtime_ns: int = 0  # source modification time in ns (0 if the backend has none)
 
 
 @dataclass(frozen=True)
@@ -47,6 +51,15 @@ class Source(Protocol):
     def list_all(self) -> Iterator[Listing]:
         """Every catalogable ``.mcap`` (key + fingerprint) for the reconcile sweep."""
 
+    def event_key(self, payload: str) -> str:
+        """Map a WatchEvent payload to this source's key (local: relpath; S3: identity)."""
+
+    def intended_key(self, key: str) -> str | None:
+        """An overriding object key embedded in the file, or ``None`` (S3: always ``None``)."""
+
+    def wait_for_stable(self, payload: str) -> bool:
+        """Whether the file is safe to read now (local: size-poll; S3: always True)."""
+
 
 def _is_catalogable_name(name: str) -> bool:
     return (
@@ -65,8 +78,12 @@ def local_etag(size: int, mtime_ns: int) -> str:
 class LocalSource:
     """The local-filesystem backend: keys are POSIX paths relative to ``root``."""
 
-    def __init__(self, root: str) -> None:
+    def __init__(
+        self, root: str, stability_checks: int = 3, stability_interval: float = 0.5
+    ) -> None:
         self._root = root
+        self._checks = stability_checks
+        self._interval = stability_interval
 
     def _abs(self, key: str) -> str:
         return os.path.join(self._root, key)
@@ -76,10 +93,25 @@ class LocalSource:
             st = os.stat(self._abs(key))
         except OSError:
             return None
-        return Stat(size=st.st_size, etag=local_etag(st.st_size, st.st_mtime_ns))
+        return Stat(
+            size=st.st_size,
+            etag=local_etag(st.st_size, st.st_mtime_ns),
+            mtime_ns=st.st_mtime_ns,
+        )
 
     def open_summary(self, key: str, size: int) -> BinaryIO:
         return open(self._abs(key), "rb")
+
+    def event_key(self, payload: str) -> str:
+        # watchdog hands absolute paths; the key is the path relative to root.
+        return os.path.relpath(payload, self._root).replace(os.sep, "/")
+
+    def intended_key(self, key: str) -> str | None:
+        # A locally-staged file may carry the S3 key it is destined for.
+        return extract_s3_key(self._abs(key))
+
+    def wait_for_stable(self, payload: str) -> bool:
+        return wait_for_stable(payload, self._interval, self._checks)
 
     def list_all(self) -> Iterator[Listing]:
         root = Path(self._root)

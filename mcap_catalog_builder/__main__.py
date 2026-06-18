@@ -1,8 +1,10 @@
 """CLI entry point: ``python3 -m mcap_catalog_builder <watch_root> [options]``.
 
-Architecture: the watchdog observer, the debounce Timers, and the periodic
-rescan thread are PRODUCERS — they only enqueue WatchEvents. ``worker_loop`` (run
-on the main thread) is the single CONSUMER and the only DB writer.
+Architecture: the producers (the watchdog observer + debounce Timers for local,
+or the SQS event drainer for S3, plus the periodic rescan thread) only enqueue
+WatchEvents. ``worker_loop`` (run on the main thread) is the single CONSUMER and
+the only DB writer. It is driven by a storage ``Source`` and is identical for
+both backends.
 """
 
 import argparse
@@ -14,9 +16,10 @@ import sqlite3
 import threading
 
 from .db import Caches, load_caches, open_db
-from .builder import delete_by_path, catalog_file
+from .builder import catalog_object, delete_by_key
 from .reconcile import full_reconcile
-from .watcher import McapEventHandler, WatchEvent, start_observer, wait_for_stable
+from .storage import LocalSource
+from .watcher import McapEventHandler, WatchEvent, start_observer
 
 logger = logging.getLogger(__name__)
 
@@ -27,18 +30,24 @@ def build_parser() -> argparse.ArgumentParser:
     """Build the CLI argument parser."""
     p = argparse.ArgumentParser(
         prog="mcap_catalog_builder",
-        description="Watch a folder of .mcap files and keep the SQLite catalog in sync.",
+        description="Watch a folder (or S3 bucket) of .mcap files and keep the SQLite catalog in sync.",
     )
-    p.add_argument("watch_root", help="folder of .mcap recordings to watch")
+    p.add_argument("watch_root", nargs="?", default=".",
+                   help="folder of .mcap recordings to watch (local source)")
+    p.add_argument("--source", choices=["local", "s3"], default="local",
+                   help="storage backend (default: local)")
+    p.add_argument("--s3-bucket", default=None, help="[s3] bucket name")
+    p.add_argument("--s3-prefix", default="", help="[s3] key prefix to scope listing")
+    p.add_argument("--sqs-url", default=None, help="[s3] SQS queue URL for S3 event notifications")
     p.add_argument("--db", default=DEFAULT_DB, help=f"catalog DB path (default: {DEFAULT_DB})")
     p.add_argument("--rescan-interval", type=float, default=300.0,
                    help="seconds between safety re-scans (default: 300)")
     p.add_argument("--debounce", type=float, default=2.0,
-                   help="seconds to debounce file events (default: 2)")
+                   help="[local] seconds to debounce file events (default: 2)")
     p.add_argument("--stability-checks", type=int, default=3,
-                   help="size-stability poll count before cataloging (default: 3)")
+                   help="[local] size-stability poll count before cataloging (default: 3)")
     p.add_argument("--stability-interval", type=float, default=0.5,
-                   help="seconds between size-stability polls (default: 0.5)")
+                   help="[local] seconds between size-stability polls (default: 0.5)")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -47,14 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
 def worker_loop(
     conn: sqlite3.Connection,
     caches: Caches,
-    watched_root: str,
+    source,
     work_q: "queue.Queue[WatchEvent]",
-    stability_checks: int,
-    stability_interval: float,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
-    Each event is handled under a try/except so the worker never dies.
+    Backend-agnostic: each event's payload is mapped to a key via the source,
+    stability is gated by the source (local polls; S3 is atomic), and every event
+    is handled under a try/except so the worker never dies.
     """
     while True:
         ev = work_q.get()
@@ -62,14 +71,14 @@ def worker_loop(
             if ev.kind == "stop":
                 break
             if ev.kind == "catalog":
-                if wait_for_stable(ev.path, stability_interval, stability_checks):
-                    catalog_file(conn, caches, ev.path, watched_root)
+                if source.wait_for_stable(ev.path):
+                    catalog_object(conn, caches, source.event_key(ev.path), source)
                 else:
                     logger.warning("file not stable, dropping (retries on rescan): %s", ev.path)
             elif ev.kind == "delete":
-                delete_by_path(conn, caches, ev.path, watched_root)
+                delete_by_key(conn, caches, source.event_key(ev.path))
             elif ev.kind == "rescan":
-                full_reconcile(conn, caches, watched_root)
+                full_reconcile(conn, caches, source)
             else:
                 logger.warning("unknown event: %r", ev)
         except Exception:  # noqa: BLE001 - the worker must never die
@@ -83,28 +92,56 @@ def main(argv: list[str] | None = None) -> int:
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    if not os.path.isdir(args.watch_root):
-        logger.error("watch_root is not a directory: %s", args.watch_root)
-        return 2
+
+    work_q: "queue.Queue[WatchEvent]" = queue.Queue()
+    stop_event = threading.Event()
+    observer = None
+    handler = None
+    start_producer = None  # deferred until after the startup reconcile
+
+    # --- build + validate the source (producers are started later) -----------
+    if args.source == "s3":
+        if not args.s3_bucket or not args.sqs_url:
+            logger.error("--source s3 requires --s3-bucket and --sqs-url")
+            return 2
+        import boto3  # imported lazily so local mode has no boto3 dependency
+        from .s3_storage import S3Source
+        from .s3_producer import s3_event_producer
+
+        source = S3Source(boto3.client("s3"), args.s3_bucket, args.s3_prefix)
+
+        def start_producer() -> None:
+            threading.Thread(
+                target=s3_event_producer,
+                args=(boto3.client("sqs"), args.sqs_url, work_q, stop_event),
+                daemon=True,
+            ).start()
+            logger.info("watching s3://%s/%s via %s", args.s3_bucket, args.s3_prefix, args.sqs_url)
+    else:
+        if not os.path.isdir(args.watch_root):
+            logger.error("watch_root is not a directory: %s", args.watch_root)
+            return 2
+        source = LocalSource(args.watch_root, args.stability_checks, args.stability_interval)
+
+        def start_producer() -> None:
+            nonlocal observer, handler
+            handler = McapEventHandler(work_q, args.debounce)
+            observer = start_observer(args.watch_root, handler)
+            logger.info("watching %s", args.watch_root)
 
     conn = open_db(args.db)
     caches = load_caches(conn)
-    work_q: "queue.Queue[WatchEvent]" = queue.Queue()
 
-    logger.info("startup reconcile of %s", args.watch_root)
-    full_reconcile(conn, caches, args.watch_root)  # synchronous, before the observer
+    logger.info("startup reconcile (db=%s)", args.db)
+    full_reconcile(conn, caches, source)  # synchronous, before watching for events
 
-    handler = McapEventHandler(work_q, args.debounce)
-    observer = start_observer(args.watch_root, handler)
-
-    stop_event = threading.Event()
+    start_producer()  # begin enqueuing live events only after the reconcile
 
     def rescan_loop() -> None:
         while not stop_event.wait(args.rescan_interval):
             work_q.put(WatchEvent("rescan"))
 
-    rescan_thread = threading.Thread(target=rescan_loop, daemon=True)
-    rescan_thread.start()
+    threading.Thread(target=rescan_loop, daemon=True).start()
 
     def _on_signal(_signum, _frame) -> None:
         work_q.put(WatchEvent("stop"))
@@ -112,17 +149,15 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    logger.info("watching %s (db=%s)", args.watch_root, args.db)
     try:
-        worker_loop(
-            conn, caches, args.watch_root, work_q,
-            args.stability_checks, args.stability_interval,
-        )
+        worker_loop(conn, caches, source, work_q)
     finally:
         stop_event.set()
-        handler.cancel_timers()
-        observer.stop()
-        observer.join()
+        if handler is not None:
+            handler.cancel_timers()
+        if observer is not None:
+            observer.stop()
+            observer.join()
         conn.close()
     return 0
 

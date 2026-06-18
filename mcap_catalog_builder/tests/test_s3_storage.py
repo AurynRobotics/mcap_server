@@ -113,6 +113,13 @@ def test_list_all_filters_non_mcap_and_unquotes_etag():
     assert listings[1].stat.size == 2
 
 
+def test_s3_event_translation_helpers():
+    src = S3Source(FakeS3({}), "bucket")
+    assert src.event_key("customer=a/.../x.mcap") == "customer=a/.../x.mcap"  # key is the key
+    assert src.intended_key("anything") is None       # the object key is authoritative
+    assert src.wait_for_stable("anything") is True     # S3 PUT is atomic, no poll
+
+
 def test_open_summary_reads_real_mcap_without_downloading_body(tmp_path):
     # A real MCAP with a multi-MB, incompressible body so "body skipped" is
     # unmistakable: the summary section is tiny next to the message chunks.

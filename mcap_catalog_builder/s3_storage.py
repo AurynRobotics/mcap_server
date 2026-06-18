@@ -27,6 +27,13 @@ def _is_missing(exc: Exception) -> bool:
     return resp.get("Error", {}).get("Code") in _MISSING_CODES
 
 
+def _last_modified_ns(last_modified) -> int:
+    """Convert a boto3 ``LastModified`` datetime to ns, or 0 if absent."""
+    if last_modified is None:
+        return 0
+    return int(last_modified.timestamp() * 1_000_000_000)
+
+
 class S3RangeReader(io.RawIOBase):
     """A seekable, read-only view of an S3 object backed by HTTP Range GETs.
 
@@ -84,7 +91,20 @@ class S3Source:
             if _is_missing(e):
                 return None
             raise
-        return Stat(size=h["ContentLength"], etag=h["ETag"].strip('"'))
+        return Stat(
+            size=h["ContentLength"],
+            etag=h["ETag"].strip('"'),
+            mtime_ns=_last_modified_ns(h.get("LastModified")),
+        )
+
+    def event_key(self, payload: str) -> str:
+        return payload  # the SQS event already carries the object key
+
+    def intended_key(self, key: str) -> str | None:
+        return None  # the object key is authoritative; no in-file override
+
+    def wait_for_stable(self, payload: str) -> bool:
+        return True  # an S3 PUT / multipart-complete is atomic — nothing to poll
 
     def open_summary(self, key: str, size: int):
         # BufferedReader coalesces the MCAP reader's small sequential reads of

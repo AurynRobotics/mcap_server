@@ -5,6 +5,7 @@ These helpers let the suite exercise the happy path even though the real
 copied into a Hive tree, or a synthetic MCAP with an injected ``s3_key`` used).
 """
 
+import io
 import os
 import shutil
 
@@ -12,6 +13,53 @@ import pytest
 from mcap.writer import Writer
 
 DEXORY_DIR = "/home/davide/ws_plotjuggler/DATA/dexory"
+
+
+class _S3ClientError(Exception):
+    """Mimics botocore's ClientError shape for the missing-object path."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.response = {"Error": {"Code": code}}
+
+
+class InMemoryS3Client:
+    """A minimal in-memory S3 client (head / ranged get / list) for tests.
+
+    Serves bytes from a ``{key: data}`` dict and tallies the bytes fetched, so
+    tests can assert the cheap-read property without touching AWS or boto3.
+    """
+
+    def __init__(self, objects: dict[str, bytes]) -> None:
+        self._objects = dict(objects)
+        self.fetched = 0
+
+    def head_object(self, Bucket, Key):
+        if Key not in self._objects:
+            raise _S3ClientError("404")
+        return {"ContentLength": len(self._objects[Key]), "ETag": f'"etag-{Key}"'}
+
+    def get_object(self, Bucket, Key, Range):
+        start_s, end_s = Range[len("bytes="):].split("-")
+        chunk = self._objects[Key][int(start_s):int(end_s) + 1]
+        self.fetched += len(chunk)
+        return {"Body": io.BytesIO(chunk)}
+
+    def get_paginator(self, name):
+        assert name == "list_objects_v2"
+        objects = self._objects
+
+        class _Paginator:
+            def paginate(self, Bucket, Prefix=""):
+                yield {
+                    "Contents": [
+                        {"Key": k, "Size": len(v), "ETag": f'"etag-{k}"'}
+                        for k, v in objects.items()
+                        if k.startswith(Prefix)
+                    ]
+                }
+
+        return _Paginator()
 
 
 def dexory_file(name: str) -> str:

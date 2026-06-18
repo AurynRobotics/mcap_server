@@ -1,27 +1,35 @@
 # mcap_catalog_builder
 
-A local-filesystem daemon that watches a folder of `.mcap` recordings and keeps the
-SQLite **catalog** (`schema.sql`) in sync: insert/update when a file is added or
-modified, hard-delete when a file is removed. It is the **single writer** to the DB.
+A daemon that watches a folder of `.mcap` recordings (or, with `--source s3`, an S3
+bucket) and keeps the SQLite **catalog** (`schema.sql`) in sync: insert/update when a
+file is added or modified, hard-delete when a file is removed. It is the **single
+writer** to the DB. Both backends drive the same single-writer worker through a
+storage `Source` seam (see [S3 backend](#s3-backend-experimental)).
 
 ## Usage
 
 ```bash
-python3 -m mcap_catalog_builder <watch_root> [options]
+python3 -m mcap_catalog_builder <watch_root> [options]                 # local (default)
+python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 ```
 
 | Option | Default | Meaning |
 |---|---|---|
-| `watch_root` (positional) | — | folder of `.mcap` files to watch (recursive) |
+| `watch_root` (positional) | `.` | [local] folder of `.mcap` files to watch (recursive) |
+| `--source` | `local` | backend: `local` or `s3` |
+| `--s3-bucket` | — | [s3] bucket name (required for `--source s3`) |
+| `--s3-prefix` | `""` | [s3] key prefix to scope the listing |
+| `--sqs-url` | — | [s3] SQS queue URL for S3 event notifications (required for `--source s3`) |
 | `--db` | `/tmp/pj-cloud-catalog.db` | catalog SQLite file |
 | `--rescan-interval` | `300.0` | seconds between safety re-scans |
-| `--debounce` | `2.0` | seconds to debounce file events |
-| `--stability-checks` | `3` | size-stability polls before cataloging |
-| `--stability-interval` | `0.5` | seconds between stability polls |
+| `--debounce` | `2.0` | [local] seconds to debounce file events |
+| `--stability-checks` | `3` | [local] size-stability polls before cataloging |
+| `--stability-interval` | `0.5` | [local] seconds between stability polls |
 | `--log-level` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` |
 
-On startup it runs a full **reconcile** (catalog missing files, hard-delete vanished
-rows), then watches via `watchdog` (inotify) plus a periodic safety re-scan.
+On startup it runs a full **reconcile** (catalog missing objects, hard-delete vanished
+rows), then watches for changes — via `watchdog` (inotify) for `local`, or by draining
+**S3→SQS** notifications for `s3` — plus a periodic safety re-scan.
 
 ## How dimensions are resolved
 
@@ -42,9 +50,10 @@ near-miss key is never guessed into a wrong row.
 
 ## Change detection & removal
 
-- **Fingerprint** = `(size_bytes, mtime_ns)` (there is no S3 ETag locally; `etag` is a
-  synthetic `local:{size}:{mtime}` token, never compared). Unchanged `(size, mtime)`
-  → the file is skipped with no read.
+- **Fingerprint = the `etag`** (R4). Cataloging skips with no body read when the stored
+  `etag` is unchanged. Local files have no real ETag, so `etag` is a synthetic
+  `local:{size}:{mtime}` token (so a size *or* mtime change re-catalogs); S3 uses the
+  object's real ETag, taken straight from the listing.
 - **Removal** hard-deletes the `files` row (tags cascade); the append-only lookups,
   dictionaries, and `topic_sets` are left as harmless orphans (no GC).
 
@@ -62,11 +71,11 @@ routes any mismatch to `catalog_failures` — making a wrong count impossible to
 
 ## S3 backend (experimental)
 
-The daemon is local-filesystem today, but the read/list/change-detect operations
-sit behind a small **storage `Source`** seam so an object store can drop in:
+The single-writer worker, reconcile, and catalog transaction are **backend-agnostic**:
+they talk to a storage **`Source`** seam (`stat` / `open_summary` / `list_all` +
+event-translation helpers), never to `os`/`open` directly. Two backends implement it:
 
-- `storage.py` — the `Source` protocol (`stat` / `open_summary` / `list_all`) plus
-  `LocalSource` (today's behavior).
+- `storage.py` — the `Source` protocol plus `LocalSource` (the local filesystem).
 - `s3_storage.py` — `S3Source` + `S3RangeReader`: reads an MCAP summary with **1–2
   HTTP range GETs** (footer → summary offset → summary), uses the **S3 ETag** as the
   R4 fingerprint, and lists via paginated `list_objects_v2`. The message body is
@@ -74,13 +83,15 @@ sit behind a small **storage `Source`** seam so an object store can drop in:
 - `s3_producer.py` — `s3_event_producer`: drains **S3→SQS** notifications into the
   same `WatchEvent` queue the inotify handler feeds (the cloud-native inotify).
 
-These modules **never import `boto3`** — the client is injected — so the library and
-its tests run with no AWS dependency.
+`builder.catalog_object` / `delete_by_key` are the unified core; `catalog_file` /
+`delete_by_path` remain as thin local wrappers. These S3 modules **never import
+`boto3`** — the client is injected — so the library and its tests run with no AWS
+dependency; only the daemon's `--source s3` mode (and the example) import boto3.
 
-> **Scope:** the S3 modules are present and unit-tested, but **not yet wired into
-> the daemon CLI** — there is no `--source s3` flag. Unifying the worker around the
-> `Source` seam is the next step. For now the S3 read path is exercised via tests
-> and the example below.
+> **Scope (experimental):** the S3 path is wired end-to-end (`--source s3`) and fully
+> unit-tested against a fake in-memory S3/SQS, but it has not yet been run against a
+> live bucket at scale, and human-edited tags / parallel cataloging are still future
+> work. The S3 modules need `boto3` + AWS credentials only at deploy time.
 
 ### How to try it
 
@@ -109,11 +120,23 @@ python3 examples/s3_read_summary.py s3://my-bucket/customer=acme/.../x.mcap
 python3 examples/s3_read_summary.py --list s3://my-bucket/customer=acme/
 ```
 
-**3. The SQS producer** is driven by a real queue: configure an S3 bucket
-notification (`ObjectCreated:*`, `ObjectRemoved:*`) to an SQS queue, then call
-`s3_event_producer(boto3.client("sqs"), queue_url, work_q, stop_event)` — it
-enqueues the same `WatchEvent`s the local watcher does. `test_s3_producer.py` shows
-the contract with a fake SQS client.
+**3. Run the daemon against S3.** First wire the bucket: add a bucket notification
+(`ObjectCreated:*`, `ObjectRemoved:*`) targeting an SQS queue, and give the host
+`s3:GetObject` + `s3:ListBucket` + `sqs:ReceiveMessage` + `sqs:DeleteMessage`. Then:
+
+```bash
+pip install boto3
+python3 -m mcap_catalog_builder --source s3 \
+    --s3-bucket my-bucket --s3-prefix customer=acme/ \
+    --sqs-url https://sqs.eu-west-1.amazonaws.com/123456789012/mcap-events \
+    --db /var/lib/pj/catalog.db
+```
+
+On startup it lists the bucket and reconciles, then catalogs each upload as its SQS
+event arrives — reading only the footer+summary of each object (no body download).
+Run it on always-on compute **in the bucket's region**, with the SQLite catalog on a
+**local/EBS disk** (never on S3). `test_s3_producer.py` shows the producer contract
+with a fake SQS client.
 
 ## Tests
 

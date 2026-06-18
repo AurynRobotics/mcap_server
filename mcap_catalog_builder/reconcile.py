@@ -1,17 +1,20 @@
-"""Full reconcile scan: catalog every on-disk file, then hard-delete vanished rows.
+"""Full reconcile scan: catalog every object in the source, then hard-delete
+vanished rows.
 
-This is the authoritative path for removals (live ``on_deleted`` events are
-best-effort). It runs on the single writer thread like everything else.
+This is the authoritative path for removals (live ``on_deleted`` / SQS-delete
+events are best-effort). It is **backend-agnostic**: it iterates a storage
+``Source.list_all()``, so it works over the local filesystem or S3. It runs on
+the single writer thread like everything else.
 """
 
 import logging
-import os
 from pathlib import Path
 
 import sqlite3
 
 from .db import Caches
-from .builder import catalog_file, resolve_dimensions
+from .builder import catalog_object, resolve_key_dims
+from .storage import LocalSource
 
 logger = logging.getLogger(__name__)
 
@@ -42,22 +45,24 @@ def scan_disk(watched_root: str) -> list[str]:
     return sorted(out)
 
 
-def full_reconcile(
-    conn: sqlite3.Connection, caches: Caches, watched_root: str
-) -> dict[str, int]:
-    """Catalog all on-disk files, then delete catalog rows with no on-disk file.
+def full_reconcile(conn: sqlite3.Connection, caches: Caches, source) -> dict[str, int]:
+    """Catalog all objects in ``source``, then delete catalog rows with no object.
 
-    Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
+    ``source`` is a storage ``Source``; a ``str`` is accepted as shorthand for a
+    local watch root. Returns a tally ``{"cataloged", "skipped", "failed", "deleted"}``.
     """
-    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
-    paths = scan_disk(watched_root)
-    for path in paths:
-        tally[catalog_file(conn, caches, path, watched_root).status] += 1
+    if isinstance(source, str):
+        source = LocalSource(source)
 
-    # Deletion sweep: composite keys present on disk (parseable + cached ids).
+    tally = {"cataloged": 0, "skipped": 0, "failed": 0, "deleted": 0}
+    listings = list(source.list_all())
+    for lst in listings:
+        tally[catalog_object(conn, caches, lst.key, source).status] += 1
+
+    # Deletion sweep: composite keys present in the source (parseable + cached ids).
     present: set[tuple] = set()
-    for path in paths:
-        res = resolve_dimensions(path, watched_root)
+    for lst in listings:
+        res = resolve_key_dims(lst.key, source)
         if res is None:
             continue
         dims = res[0]
@@ -82,7 +87,7 @@ def full_reconcile(
     conn.commit()
 
     logger.info(
-        "reconcile %s: cataloged=%d skipped=%d failed=%d deleted=%d",
-        watched_root, tally["cataloged"], tally["skipped"], tally["failed"], tally["deleted"],
+        "reconcile: cataloged=%d skipped=%d failed=%d deleted=%d",
+        tally["cataloged"], tally["skipped"], tally["failed"], tally["deleted"],
     )
     return tally

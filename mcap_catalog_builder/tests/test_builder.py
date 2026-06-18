@@ -136,7 +136,7 @@ def test_count_mismatch_guard_rolls_back(tmp_db, tmp_path, monkeypatch):
         message_count=999,  # does not match the channel counts below
         channels=[ChannelInfo(1, "/a", "S", "ros2msg", 1)],
     )
-    monkeypatch.setattr(builder, "read_file_summary", lambda _p: bad)
+    monkeypatch.setattr(builder, "summary_from_stream", lambda _stream: bad)
     assert catalog_file(conn, caches, dest, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1

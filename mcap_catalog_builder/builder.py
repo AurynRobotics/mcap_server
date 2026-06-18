@@ -1,5 +1,10 @@
 """The catalog builder core: dimension resolution + the §8 per-file transaction.
 
+The core (``catalog_object`` / ``delete_by_key``) is **backend-agnostic**: it
+talks to a storage ``Source`` (local FS or S3), never to ``os``/``open`` directly.
+``catalog_file`` / ``delete_by_path`` are thin local-filesystem wrappers kept for
+the watcher path and the existing tests.
+
 Correctness guards (this daemon is the catalog's only writer):
 - dimensions are trusted only if ``rebuild_hive_key(dims) == key`` (round-trip);
 - the ``topic_counts`` blob is built from the sorted topic-set members with a
@@ -30,7 +35,8 @@ from .db import (
     resolve_topic_set,
 )
 from .keyparse import parse_hive_key, rebuild_hive_key, relpath_key
-from .mcap_summary import derive_tags, extract_s3_key, read_file_summary
+from .mcap_summary import derive_tags, summary_from_stream
+from .storage import LocalSource, local_etag
 from .varint import encode_counts_blob
 
 logger = logging.getLogger(__name__)
@@ -59,25 +65,32 @@ def get_fingerprint(path: str) -> tuple[int, int]:
 
 
 def synth_etag(size_bytes: int, mtime_ns: int) -> str:
-    """A synthetic, never-compared etag for local files."""
-    return f"local:{size_bytes}:{mtime_ns}"
+    """A synthetic etag for local files (canonical form lives in ``storage``)."""
+    return local_etag(size_bytes, mtime_ns)
+
+
+def resolve_key_dims(key: str, source) -> tuple[dict[str, str], str] | None:
+    """Resolve a key to ``(dims, effective_key)`` via the source.
+
+    An in-file override (``source.intended_key`` — an ``s3_key`` metadata record
+    for local files; always ``None`` for S3) wins over the passed key. The result
+    is trusted only if it parses AND round-trips exactly; otherwise ``None``.
+    """
+    eff = source.intended_key(key)
+    if eff is None:
+        eff = key
+    dims = parse_hive_key(eff)
+    if dims is None:
+        return None
+    if rebuild_hive_key(dims) != eff.lstrip("/"):
+        return None
+    return dims, eff
 
 
 def resolve_dimensions(path: str, watched_root: str) -> tuple[dict[str, str], str] | None:
-    """Dimensions from the ``s3_key`` metadata, else the relative Hive path.
-
-    Returns ``(dims, key)`` only if the key parses AND round-trips exactly;
-    otherwise ``None`` (the caller records an ``catalog_failures`` row).
-    """
-    key = extract_s3_key(path)
-    if key is None:
-        key = relpath_key(path, watched_root)
-    dims = parse_hive_key(key)
-    if dims is None:
-        return None
-    if rebuild_hive_key(dims) != key.lstrip("/"):
-        return None
-    return dims, key
+    """Backward-compatible local resolver: dimensions from ``s3_key`` else the path."""
+    source = LocalSource(watched_root)
+    return resolve_key_dims(relpath_key(path, watched_root), source)
 
 
 def is_error_tag(key: str, value: str) -> bool:
@@ -87,29 +100,28 @@ def is_error_tag(key: str, value: str) -> bool:
 
 def _composite_row(conn, ids, dims):
     return conn.execute(
-        f"SELECT id, size_bytes, last_modified_ns FROM files WHERE {_COMPOSITE}",
+        f"SELECT id, etag FROM files WHERE {_COMPOSITE}",
         (*ids, dims["date"], dims["filename"]),
     ).fetchone()
 
 
-def catalog_file(
-    conn: sqlite3.Connection, caches: Caches, path: str, watched_root: str
+def catalog_object(
+    conn: sqlite3.Connection, caches: Caches, key: str, source
 ) -> CatalogResult:
-    """Catalog one MCAP file into the catalog (insert or update)."""
-    try:
-        size, mtime_ns = get_fingerprint(path)
-    except OSError as e:
-        # The file vanished (TOCTOU between scan and catalog) — not a real failure;
-        # the reconcile deletion sweep removes any stale row. Don't crash or record.
-        logger.debug("file vanished before cataloging: %s (%s)", path, e)
-        return CatalogResult("failed", "file vanished")
+    """Catalog one MCAP object (insert or update) reading bytes via ``source``."""
+    st = source.stat(key)
+    if st is None:
+        # Vanished between listing and catalog (TOCTOU) — not a real failure; the
+        # reconcile deletion sweep removes any stale row. Don't crash or record.
+        logger.debug("object vanished before cataloging: %s", key)
+        return CatalogResult("failed", "vanished")
 
-    res = resolve_dimensions(path, watched_root)
+    res = resolve_key_dims(key, source)
     if res is None:
-        record_failure(conn, relpath_key(path, watched_root), "unparseable key")
+        record_failure(conn, key, "unparseable key")
         conn.commit()
         return CatalogResult("failed", "unparseable key")
-    dims, key = res
+    dims, eff_key = res
 
     # Resolve dimension ids; commit so the (append-only) lookup rows persist.
     customer_id = resolve_customer(conn, caches, dims["customer"])
@@ -119,16 +131,18 @@ def catalog_file(
     conn.commit()
     ids = (customer_id, site_id, robot_id, source_id)
 
-    # Fingerprint-skip (read-only): no file read when (size, mtime) are unchanged.
+    # Fingerprint-skip (read-only): no body read when the etag is unchanged (R4).
     existing = _composite_row(conn, ids, dims)
-    if existing is not None and existing["size_bytes"] == size and existing["last_modified_ns"] == mtime_ns:
+    if existing is not None and existing["etag"] == st.etag:
         return CatalogResult("skipped")
 
-    # Read the summary OUTSIDE the transaction (slow / can throw).
+    # Read the summary OUTSIDE the transaction (slow / can throw). Only the
+    # footer + summary are fetched — never the message body (R2).
     try:
-        summary = read_file_summary(path)
+        with source.open_summary(key, st.size) as stream:
+            summary = summary_from_stream(stream)
     except Exception as e:  # noqa: BLE001
-        record_failure(conn, key, f"{type(e).__name__}: {e}")
+        record_failure(conn, eff_key, f"{type(e).__name__}: {e}")
         conn.commit()
         return CatalogResult("failed", str(e))
 
@@ -141,7 +155,7 @@ def catalog_file(
                 if topic_id in by_topic:  # defensive: no duplicate topics in real data
                     prev_schema, prev_count = by_topic[topic_id]
                     by_topic[topic_id] = (prev_schema, prev_count + ch.message_count)
-                    logger.warning("duplicate topic %s in %s", ch.topic, path)
+                    logger.warning("duplicate topic %s in %s", ch.topic, key)
                 else:
                     by_topic[topic_id] = (schema_id, ch.message_count)
 
@@ -169,7 +183,7 @@ def catalog_file(
                 "topic_set_id=excluded.topic_set_id, topic_counts=excluded.topic_counts, "
                 "has_error=excluded.has_error",
                 (
-                    dims["filename"], synth_etag(size, mtime_ns), size, mtime_ns, now_ns(),
+                    dims["filename"], st.etag, st.size, st.mtime_ns, now_ns(),
                     customer_id, site_id, robot_id, source_id, dims["date"],
                     summary.start_time_ns, summary.end_time_ns, set_id, blob, 0,
                 ),
@@ -189,27 +203,32 @@ def catalog_file(
             has_error = 1 if any(is_error_tag(k, v) for k, v in tags) else 0
             conn.execute("UPDATE files SET has_error=? WHERE id=?", (has_error, file_id))
 
-            conn.execute("DELETE FROM catalog_failures WHERE s3_key=?", (key,))
+            conn.execute("DELETE FROM catalog_failures WHERE s3_key=?", (eff_key,))
     except Exception as e:  # noqa: BLE001
         # The rolled-back txn may have inserted topics/schemas/sets that are now
         # gone from the DB — reload caches so they can never reference a missing row.
         caches.__dict__.update(load_caches(conn).__dict__)
-        record_failure(conn, key, f"{type(e).__name__}: {e}")
+        record_failure(conn, eff_key, f"{type(e).__name__}: {e}")
         conn.commit()
         return CatalogResult("failed", str(e))
 
     return CatalogResult("cataloged")
 
 
-def delete_by_path(
+def catalog_file(
     conn: sqlite3.Connection, caches: Caches, path: str, watched_root: str
-) -> bool:
-    """Hard-delete a removed file's row (best-effort; the reconcile sweep is authoritative).
+) -> CatalogResult:
+    """Local-filesystem entry point: catalog the file at ``path`` under ``watched_root``."""
+    source = LocalSource(watched_root)
+    return catalog_object(conn, caches, source.event_key(path), source)
 
-    The file is gone, so dimensions come from the path only and ids are resolved
-    cache-only (a missing lookup means the row cannot exist).
+
+def delete_by_key(conn: sqlite3.Connection, caches: Caches, key: str) -> bool:
+    """Hard-delete a removed object's row (best-effort; the reconcile sweep is authoritative).
+
+    Dimensions come from the key only and ids are resolved cache-only (a missing
+    lookup means the row cannot exist).
     """
-    key = relpath_key(path, watched_root)
     dims = parse_hive_key(key)
     if dims is None:
         return False
@@ -226,3 +245,10 @@ def delete_by_path(
     conn.execute("DELETE FROM catalog_failures WHERE s3_key=?", (key,))
     conn.commit()
     return cur.rowcount > 0
+
+
+def delete_by_path(
+    conn: sqlite3.Connection, caches: Caches, path: str, watched_root: str
+) -> bool:
+    """Local-filesystem entry point: delete the row for the (now-gone) ``path``."""
+    return delete_by_key(conn, caches, relpath_key(path, watched_root))
