@@ -34,31 +34,43 @@ class FileSummary:
     channels: list[ChannelInfo]
 
 
-def read_file_summary(path: str) -> FileSummary:
-    """Read the MCAP summary. Raises ``ValueError`` if no summary/statistics."""
-    with open(path, "rb") as f:
-        summary = make_reader(f).get_summary()
-        if summary is None or summary.statistics is None:
-            raise ValueError("no summary/statistics in MCAP")
-        counts = summary.statistics.channel_message_counts
-        channels: list[ChannelInfo] = []
-        for ch in summary.channels.values():
-            schema = summary.schemas.get(ch.schema_id)
-            channels.append(
-                ChannelInfo(
-                    channel_id=ch.id,
-                    topic=ch.topic,
-                    schema_name=schema.name if schema is not None else "",
-                    schema_encoding=schema.encoding if schema is not None else "",
-                    message_count=counts.get(ch.id, 0),  # .get default is MANDATORY
-                )
+def summary_from_stream(stream) -> FileSummary:
+    """Read the MCAP summary from any seekable binary ``stream``.
+
+    Split out from ``read_file_summary`` so a backend that does not have a local
+    file — e.g. an S3 object read via range GETs — can reuse the exact same
+    parser over a file-like object. ``get_summary()`` only seeks to the footer
+    and reads the summary section, so the message body is never streamed.
+    Raises ``ValueError`` if there is no summary/statistics.
+    """
+    summary = make_reader(stream).get_summary()
+    if summary is None or summary.statistics is None:
+        raise ValueError("no summary/statistics in MCAP")
+    counts = summary.statistics.channel_message_counts
+    channels: list[ChannelInfo] = []
+    for ch in summary.channels.values():
+        schema = summary.schemas.get(ch.schema_id)
+        channels.append(
+            ChannelInfo(
+                channel_id=ch.id,
+                topic=ch.topic,
+                schema_name=schema.name if schema is not None else "",
+                schema_encoding=schema.encoding if schema is not None else "",
+                message_count=counts.get(ch.id, 0),  # .get default is MANDATORY
             )
-        return FileSummary(
-            start_time_ns=summary.statistics.message_start_time,
-            end_time_ns=summary.statistics.message_end_time,
-            message_count=summary.statistics.message_count,
-            channels=channels,
         )
+    return FileSummary(
+        start_time_ns=summary.statistics.message_start_time,
+        end_time_ns=summary.statistics.message_end_time,
+        message_count=summary.statistics.message_count,
+        channels=channels,
+    )
+
+
+def read_file_summary(path: str) -> FileSummary:
+    """Read the MCAP summary from a local file. Raises ``ValueError`` if absent."""
+    with open(path, "rb") as f:
+        return summary_from_stream(f)
 
 
 def extract_s3_key(path: str) -> str | None:

@@ -60,6 +60,61 @@ The `topic_counts` blob is built from the file's sorted topic-set members with
 that dict), guarded by an in-transaction `sum(counts) == message_count` check that
 routes any mismatch to `catalog_failures` — making a wrong count impossible to commit.
 
+## S3 backend (experimental)
+
+The daemon is local-filesystem today, but the read/list/change-detect operations
+sit behind a small **storage `Source`** seam so an object store can drop in:
+
+- `storage.py` — the `Source` protocol (`stat` / `open_summary` / `list_all`) plus
+  `LocalSource` (today's behavior).
+- `s3_storage.py` — `S3Source` + `S3RangeReader`: reads an MCAP summary with **1–2
+  HTTP range GETs** (footer → summary offset → summary), uses the **S3 ETag** as the
+  R4 fingerprint, and lists via paginated `list_objects_v2`. The message body is
+  never downloaded.
+- `s3_producer.py` — `s3_event_producer`: drains **S3→SQS** notifications into the
+  same `WatchEvent` queue the inotify handler feeds (the cloud-native inotify).
+
+These modules **never import `boto3`** — the client is injected — so the library and
+its tests run with no AWS dependency.
+
+> **Scope:** the S3 modules are present and unit-tested, but **not yet wired into
+> the daemon CLI** — there is no `--source s3` flag. Unifying the worker around the
+> `Source` seam is the next step. For now the S3 read path is exercised via tests
+> and the example below.
+
+### How to try it
+
+**1. Unit tests — no AWS, no boto3.** A fake in-memory S3 client serves real MCAP
+bytes and records every range requested, so the cheap-read property is asserted
+directly:
+
+```bash
+cd /home/davide/ws_plotjuggler/auryn-mcap-server
+python3 -m pytest mcap_catalog_builder/tests/test_s3_storage.py \
+                  mcap_catalog_builder/tests/test_s3_producer.py \
+                  mcap_catalog_builder/tests/test_storage.py -v
+```
+
+**2. Against a real bucket** — needs `boto3` and AWS credentials (env vars,
+`~/.aws`, or an instance role) with `s3:GetObject` (and `s3:ListBucket` for `--list`):
+
+```bash
+pip install boto3   # only needed to actually hit S3
+
+# Read one recording's signals/counts/time span — prints bytes fetched vs object
+# size, showing the body was skipped (e.g. "fetched 7,914 of 512,338,001 bytes"):
+python3 examples/s3_read_summary.py s3://my-bucket/customer=acme/.../x.mcap
+
+# List the .mcap objects under a prefix (key + ETag, from the listing, no body read):
+python3 examples/s3_read_summary.py --list s3://my-bucket/customer=acme/
+```
+
+**3. The SQS producer** is driven by a real queue: configure an S3 bucket
+notification (`ObjectCreated:*`, `ObjectRemoved:*`) to an SQS queue, then call
+`s3_event_producer(boto3.client("sqs"), queue_url, work_q, stop_event)` — it
+enqueues the same `WatchEvent`s the local watcher does. `test_s3_producer.py` shows
+the contract with a fake SQS client.
+
 ## Tests
 
 ```bash

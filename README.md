@@ -21,7 +21,11 @@ upload ──► catalog builder ──► SQLite catalog ──► query server
 - **[`mcap_catalog_builder/`](mcap_catalog_builder/)** — the catalog builder daemon (single writer, WAL,
   footer-only reads, fingerprint-skip) + tests.
   [`schema.sql`](mcap_catalog_builder/schema.sql) is the catalog schema;
-  [`README.md`](mcap_catalog_builder/README.md) documents the CLI.
+  [`README.md`](mcap_catalog_builder/README.md) documents the CLI **and the
+  experimental S3 backend** (range-GET reads + SQS-driven cataloging).
+- **[`examples/`](examples/)** — runnable demos, e.g.
+  [`s3_read_summary.py`](examples/s3_read_summary.py): read an MCAP summary straight
+  from S3 without downloading the file.
 
 ## Quickstart
 

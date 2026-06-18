@@ -1,7 +1,25 @@
 """Tests for MCAP summary extraction + s3_key metadata reading."""
 
-from mcap_catalog_builder.mcap_summary import derive_tags, extract_s3_key, read_file_summary
+from mcap_catalog_builder.mcap_summary import (
+    derive_tags,
+    extract_s3_key,
+    read_file_summary,
+    summary_from_stream,
+)
 from mcap_catalog_builder.tests.fixtures import dexory_file, write_minimal_mcap
+
+
+def test_summary_from_stream_matches_path_read(tmp_path):
+    """summary_from_stream(open_file) equals read_file_summary(path) — the split
+    that lets the S3 backend reuse the parser over a range-backed stream."""
+    dest = str(tmp_path / "x.mcap")
+    write_minimal_mcap(
+        dest, channels=[("/a", "S", "ros2msg", 3), ("/zero", "S", "ros2msg", 0)]
+    )
+    from_path = read_file_summary(dest)
+    with open(dest, "rb") as f:
+        from_stream = summary_from_stream(f)
+    assert from_stream == from_path
 
 
 def test_zero_count_channel_present_with_zero(tmp_path):
