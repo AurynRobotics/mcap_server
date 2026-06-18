@@ -16,3 +16,6 @@ venv/
 
 # OS / editor
 .DS_Store
+
+# Git worktrees (kept inside the repo under .worktrees/)
+.worktrees/
