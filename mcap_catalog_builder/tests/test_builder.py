@@ -13,7 +13,7 @@ from mcap_catalog_builder.builder import (
     synth_etag,
 )
 from mcap_catalog_builder.mcap_summary import ChannelInfo, FileSummary
-from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
+from mcap_catalog_builder.tests.fixtures import write_minimal_mcap, write_unsummarized_mcap
 from mcap_catalog_builder.varint import decode_counts_blob
 
 DIMS = {
@@ -181,6 +181,73 @@ def test_catalog_vanished_file_does_not_crash(tmp_db, tmp_path):
     assert catalog_file(conn, caches, missing, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 0
+
+
+def test_broken_reupload_unsummarized_quarantines_stale_row(tmp_db, tmp_path):
+    # A healthy cataloged file RE-UPLOADED as unsummarized must NOT linger as a
+    # stale healthy row beside its catalog_failures entry (§4.6 / H1).
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _hive_path(root, DIMS)
+    write_minimal_mcap(dest, channels=[("/a", "S", "ros2msg", 2)])
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+
+    # Overwrite the SAME key with a broken (unsummarized) file; bump mtime so the
+    # local etag changes and the unchanged-skip does NOT fire.
+    write_unsummarized_mcap(dest)
+    st = os.stat(dest)
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert catalog_file(conn, caches, dest, root).status == "failed"
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0       # stale row removed
+    assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
+
+
+def test_broken_reupload_count_mismatch_quarantines_stale_row(tmp_db, tmp_path, monkeypatch):
+    # The transaction-failure path (count mismatch on a re-upload) must also drop
+    # the rolled-back-to OLD healthy row, not keep it (§4.6 / H1).
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _hive_path(root, DIMS)
+    write_minimal_mcap(dest, channels=[("/a", "S", "ros2msg", 2)])
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"  # real summary
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 1
+
+    st = os.stat(dest)
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))  # etag changes
+    bad = FileSummary(start_time_ns=1, end_time_ns=2, message_count=999, chunk_count=1,
+                      channels=[ChannelInfo(1, "/a", "S", "ros2msg", 1)])  # sum=1 != 999
+    monkeypatch.setattr(builder, "summary_from_stream", lambda _s: bad)
+    assert catalog_file(conn, caches, dest, root).status == "failed"
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
+
+
+def test_unsummarized_file_quarantined(tmp_db, tmp_path):
+    # An MCAP with no Statistics (unsummarized) must be QUARANTINED to
+    # catalog_failures — NEVER written as a silent zero-count files row (§4.6).
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _hive_path(root, DIMS)
+    write_unsummarized_mcap(dest)
+    assert catalog_file(conn, caches, dest, root).status == "failed"
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
+    assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 1
+
+
+def test_empty_recording_sets_has_error(tmp_db, tmp_path):
+    # A cataloged-but-EMPTY recording (0 messages) is flagged has_error=1 — the v1
+    # validation-health signal (§4.4). It still catalogs (it is not a failure).
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _write_hive(root, channels=[("/a", "S", "ros2msg", 0)])  # declared, zero messages
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
+    assert conn.execute("SELECT has_error FROM files").fetchone()["has_error"] == 1
+    # A non-empty recording stays has_error=0.
+    dest2 = _hive_path(root, {**DIMS, "filename": "ok.mcap"})
+    write_minimal_mcap(dest2, channels=[("/a", "S", "ros2msg", 2)])
+    catalog_file(conn, caches, dest2, root)
+    assert conn.execute("SELECT has_error FROM files WHERE filename='ok.mcap'").fetchone()["has_error"] == 0
 
 
 def test_chunk_count_populated(tmp_db, tmp_path):

@@ -136,3 +136,18 @@ def write_minimal_mcap(
 def write_flat_no_metadata(dest: str) -> None:
     """A minimal MCAP with no ``s3_key`` metadata (mimics the flat Dexory samples)."""
     write_minimal_mcap(dest, s3_key=None, channels=[("/a", "S", "ros2msg", 1)])
+
+
+def write_unsummarized_mcap(dest: str, s3_key: str | None = None) -> None:
+    """An MCAP with NO Statistics/summary (``use_statistics=False``) — the codec
+    rejects it, so the builder must quarantine it (catalog-migration §4.6)."""
+    os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+    with open(dest, "wb") as f:
+        writer = Writer(f, use_statistics=False, use_summary_offsets=False)
+        writer.start(profile="ros2", library="test-fixture")
+        sid = writer.register_schema(name="S", encoding="ros2msg", data=b"x")
+        cid = writer.register_channel(topic="/a", message_encoding="cdr", schema_id=sid)
+        writer.add_message(channel_id=cid, log_time=1, data=b"d", publish_time=1, sequence=0)
+        if s3_key is not None:
+            writer.add_metadata(name="s3_key", data={"key": s3_key})
+        writer.finish()

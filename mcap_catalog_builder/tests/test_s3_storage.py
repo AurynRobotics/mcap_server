@@ -7,10 +7,16 @@ summary never downloads the message body — without touching AWS or boto3.
 
 import io
 
+import pytest
 from mcap.writer import CompressionType, Writer
 
 from mcap_catalog_builder.mcap_summary import read_file_summary, summary_from_stream
-from mcap_catalog_builder.s3_storage import S3RangeReader, S3Source
+from mcap_catalog_builder.s3_storage import (
+    S3RangeReader,
+    S3Source,
+    _is_missing,
+    _is_permanent,
+)
 from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 
 
@@ -103,6 +109,32 @@ def test_stat_returns_size_and_unquoted_etag():
 
 def test_stat_missing_returns_none():
     assert S3Source(FakeS3({}), "bucket").stat("gone.mcap") is None
+
+
+def test_permanent_classifier_includes_auth_and_missing():
+    # Auth/bad-request + missing are permanent (not retried); 5xx/throttle retry.
+    for code in ("403", "AccessDenied", "Forbidden", "400", "404", "NoSuchKey"):
+        assert _is_permanent(_FakeClientError(code)), code
+    for code in ("500", "503", "SlowDown"):
+        assert not _is_permanent(_FakeClientError(code)), code
+    assert _is_missing(_FakeClientError("404")) and not _is_missing(_FakeClientError("403"))
+
+
+def test_stat_auth_error_raises_not_retried():
+    # A 403 must propagate (not be mapped to None, not retried 6x).
+    class _Counting(FakeS3):
+        def __init__(self):
+            super().__init__({})
+            self.head_calls = 0
+
+        def head_object(self, Bucket, Key):
+            self.head_calls += 1
+            raise _FakeClientError("403")
+
+    c = _Counting()
+    with pytest.raises(_FakeClientError):
+        S3Source(c, "bucket").stat("x.mcap")
+    assert c.head_calls == 1  # permanent => no retry
 
 
 def test_list_all_filters_non_mcap_and_unquotes_etag():

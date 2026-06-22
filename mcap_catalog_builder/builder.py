@@ -105,6 +105,19 @@ def _composite_row(conn, ids, dims):
     ).fetchone()
 
 
+def _quarantine_existing(conn, ids, dims, eff_key: str, error_text: str) -> None:
+    """Record a catalog failure AND delete any existing ``files`` row for this key,
+    in one commit — so a now-broken file is never left as a stale "healthy" row
+    beside its ``catalog_failures`` entry (§4.6). The row's tags cascade-delete (the
+    file is no longer servable; same as a vanished-object deletion). ``ids``/``dims``
+    are resolved before either failure path, so they are always in scope here."""
+    conn.execute(
+        f"DELETE FROM files WHERE {_COMPOSITE}", (*ids, dims["date"], dims["filename"])
+    )
+    record_failure(conn, eff_key, error_text)
+    conn.commit()
+
+
 def catalog_object(
     conn: sqlite3.Connection, caches: Caches, key: str, source
 ) -> CatalogResult:
@@ -142,8 +155,12 @@ def catalog_object(
         with source.open_summary(key, st.size) as stream:
             summary = summary_from_stream(stream)
     except Exception as e:  # noqa: BLE001
-        record_failure(conn, eff_key, f"{type(e).__name__}: {e}")
-        conn.commit()
+        # QUARANTINE: a file is NEVER simultaneously "cataloged" and "failed". If a
+        # previously-healthy row exists for this key (a broken RE-UPLOAD: etag
+        # changed so the skip didn't fire, summary now unreadable), delete it in the
+        # same commit as the failure — otherwise it would linger as a stale healthy
+        # row the reconcile sweep can't remove (the object still exists). (§4.6)
+        _quarantine_existing(conn, ids, dims, eff_key, f"{type(e).__name__}: {e}")
         return CatalogResult("failed", str(e))
 
     try:
@@ -204,7 +221,16 @@ def catalog_object(
                     "INSERT INTO tags_embedded(file_id, key, value) VALUES (?, ?, ?)",
                     [(file_id, k, v) for k, v in tags],
                 )
-            has_error = 1 if any(is_error_tag(k, v) for k, v in tags) else 0
+            # has_error = the materialized validation-health predicate (catalog-
+            # migration §4.4). v1 signals: an explicit error tag, OR an EMPTY
+            # recording (0 messages) — a cataloged-but-suspect file an operator
+            # wants to surface/skip. (An UNSUMMARIZED file never reaches here — it
+            # raises in summary_from_stream and is quarantined to catalog_failures,
+            # §4.6.) Distinct from catalog_failures (files that could not be
+            # cataloged at all).
+            has_error = 1 if (
+                any(is_error_tag(k, v) for k, v in tags) or summary.message_count == 0
+            ) else 0
             conn.execute("UPDATE files SET has_error=? WHERE id=?", (has_error, file_id))
 
             conn.execute("DELETE FROM catalog_failures WHERE s3_key=?", (eff_key,))
@@ -212,8 +238,10 @@ def catalog_object(
         # The rolled-back txn may have inserted topics/schemas/sets that are now
         # gone from the DB — reload caches so they can never reference a missing row.
         caches.__dict__.update(load_caches(conn).__dict__)
-        record_failure(conn, eff_key, f"{type(e).__name__}: {e}")
-        conn.commit()
+        # The rollback reverted the upsert to the OLD row (a re-upload that newly
+        # fails its count check). Quarantine it: drop that stale row so the file is
+        # not both "cataloged" (stale) and "failed". (§4.6)
+        _quarantine_existing(conn, ids, dims, eff_key, f"{type(e).__name__}: {e}")
         return CatalogResult("failed", str(e))
 
     return CatalogResult("cataloged")

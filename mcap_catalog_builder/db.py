@@ -52,6 +52,12 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
+    # synchronous=NORMAL under WAL: durable across an app crash, only risking the
+    # last transaction on a power loss / OS crash. The catalog is a rebuildable
+    # cache of the bucket (a lost write re-extracts on the next reconcile), so the
+    # throughput win over FULL is worth it. The Go reader is read-only, so its DSN
+    # does not set synchronous (it never writes). (catalog-migration §4.3)
+    conn.execute("PRAGMA synchronous = NORMAL")
     # Two guards BEFORE any DDL, so a wrong DB is NEVER mutated:
     #  (1) a DB with tables but no schema_version (legacy Go / foreign catalog) is
     #      refused — applying schema.sql would create+stamp it and defeat the

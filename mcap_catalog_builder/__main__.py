@@ -34,11 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("watch_root", nargs="?", default=".",
                    help="folder of .mcap recordings to watch (local source)")
-    p.add_argument("--source", choices=["local", "s3"], default="local",
+    p.add_argument("--source", choices=["local", "s3", "gcs"], default="local",
                    help="storage backend (default: local)")
     p.add_argument("--s3-bucket", default=None, help="[s3] bucket name")
     p.add_argument("--s3-prefix", default="", help="[s3] key prefix to scope listing")
     p.add_argument("--sqs-url", default=None, help="[s3] SQS queue URL for S3 event notifications")
+    p.add_argument("--gcs-bucket", default=None, help="[gcs] bucket name")
+    p.add_argument("--gcs-prefix", default="", help="[gcs] object-name prefix to scope listing")
     p.add_argument("--db", default=DEFAULT_DB, help=f"catalog DB path (default: {DEFAULT_DB})")
     p.add_argument("--once", action="store_true",
                    help="run one synchronous full reconcile, then exit (no watching). "
@@ -127,6 +129,21 @@ def main(argv: list[str] | None = None) -> int:
                 daemon=True,
             ).start()
             logger.info("watching s3://%s/%s via %s", args.s3_bucket, args.s3_prefix, args.sqs_url)
+    elif args.source == "gcs":
+        if not args.gcs_bucket:
+            logger.error("--source gcs requires --gcs-bucket")
+            return 2
+        from google.cloud import storage as gcs_storage_lib  # lazy: no google dep for local/s3
+        from .gcs_storage import GCSSource
+
+        # STORAGE_EMULATOR_HOST is auto-handled by the SDK (the fake-gcs leg).
+        source = GCSSource(gcs_storage_lib.Client(), args.gcs_bucket, args.gcs_prefix)
+
+        def start_producer() -> None:
+            # GCS has no live-event producer wired today (Pub/Sub is future work,
+            # mirroring S3's SQS); the periodic rescan keeps the catalog in sync.
+            logger.info("watching gcs://%s/%s (rescan-only; --once for a one-shot build)",
+                        args.gcs_bucket, args.gcs_prefix)
     else:
         if not os.path.isdir(args.watch_root):
             logger.error("watch_root is not a directory: %s", args.watch_root)

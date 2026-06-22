@@ -10,28 +10,43 @@ turns each of those seeks/reads into a small HTTP Range GET — so the message
 body is never downloaded, however large the recording.
 """
 
+import calendar
 import io
 from typing import Iterator
 
+from .retry import retry_with
 from .storage import Listing, Stat
 
 # Error codes a HEAD/GET returns when an object is absent (duck-typed off the
 # botocore ClientError shape, so botocore need not be importable here).
 _MISSING_CODES = {"404", "NoSuchKey", "NotFound"}
+# Permanent (non-retryable) codes: missing + auth/bad-request. Retrying these just
+# wastes the backoff budget per file (mirrors the Go classifier's ErrPermanent).
+_PERMANENT_CODES = _MISSING_CODES | {"403", "AccessDenied", "Forbidden", "400", "InvalidRequest"}
+
+
+def _err_code(exc: Exception):
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return None
+    return resp.get("Error", {}).get("Code")
 
 
 def _is_missing(exc: Exception) -> bool:
-    resp = getattr(exc, "response", None)
-    if not isinstance(resp, dict):
-        return False
-    return resp.get("Error", {}).get("Code") in _MISSING_CODES
+    return _err_code(exc) in _MISSING_CODES
+
+
+def _is_permanent(exc: Exception) -> bool:
+    return _err_code(exc) in _PERMANENT_CODES
 
 
 def _last_modified_ns(last_modified) -> int:
-    """Convert a boto3 ``LastModified`` datetime to ns, or 0 if absent."""
+    """Convert a boto3 ``LastModified`` datetime to ns, or 0 if absent. Integer
+    arithmetic (no float*1e9) so the value is exact to microsecond resolution and
+    matches Go's UnixNano()."""
     if last_modified is None:
         return 0
-    return int(last_modified.timestamp() * 1_000_000_000)
+    return calendar.timegm(last_modified.utctimetuple()) * 1_000_000_000 + last_modified.microsecond * 1000
 
 
 class S3RangeReader(io.RawIOBase):
@@ -67,9 +82,12 @@ class S3RangeReader(io.RawIOBase):
         if self._pos >= self._size:
             return 0  # at/past EOF: never issue an out-of-range request
         end = min(self._pos + len(b), self._size) - 1  # HTTP Range end is inclusive
-        body = self._c.get_object(
-            Bucket=self._bucket, Key=self._key, Range=f"bytes={self._pos}-{end}",
-        )["Body"].read()
+        body = retry_with(
+            lambda: self._c.get_object(
+                Bucket=self._bucket, Key=self._key, Range=f"bytes={self._pos}-{end}",
+            )["Body"].read(),
+            is_permanent=_is_permanent,
+        )
         n = len(body)
         b[:n] = body
         self._pos += n
@@ -86,7 +104,10 @@ class S3Source:
 
     def stat(self, key: str) -> Stat | None:
         try:
-            h = self._c.head_object(Bucket=self._bucket, Key=key)
+            h = retry_with(
+                lambda: self._c.head_object(Bucket=self._bucket, Key=key),
+                is_permanent=_is_permanent,
+            )
         except Exception as e:  # noqa: BLE001 - re-raised unless it's a missing-object
             if _is_missing(e):
                 return None
