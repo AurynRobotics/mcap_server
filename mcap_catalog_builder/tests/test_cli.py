@@ -44,7 +44,17 @@ def test_main_bad_watch_root_returns_2(tmp_path):
 
 
 def test_main_s3_without_bucket_returns_2():
-    assert main(["--source", "s3"]) == 2  # requires --s3-bucket and --sqs-url
+    assert main(["--source", "s3"]) == 2  # --source s3 requires --s3-bucket
+
+
+def test_main_s3_daemon_without_sqs_returns_2():
+    # The watch daemon (no --once) still requires --sqs-url to drain live events.
+    assert main(["--source", "s3", "--s3-bucket", "b"]) == 2
+
+
+def test_parser_once_flag():
+    assert build_parser().parse_args(["d"]).once is False
+    assert build_parser().parse_args(["--once", "d"]).once is True
 
 
 def test_worker_loop_stops_on_stop_event(tmp_db):

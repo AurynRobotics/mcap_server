@@ -10,6 +10,19 @@
 -- SQLite allows forward FK references (the target need only exist at row-write
 -- time), so the create order below is fine as written.
 
+-- schema_version: single-row table pinning the cross-language catalog contract
+-- version (see CATALOG_CONTRACT.md). The Python builder writes it; the Go reader
+-- and Python open_db both FAIL FAST on mismatch, so a DB written by an
+-- incompatible builder/reader can never be silently mis-served. The version
+-- integer is NOT seeded here — it lives in db.py (SCHEMA_VERSION), the single
+-- source of truth for the writer. CHECK(id=1) makes the table structurally
+-- single-row. Bump SCHEMA_VERSION on ANY change to a table/column the Go reader
+-- reads.
+CREATE TABLE IF NOT EXISTS schema_version (
+    id      INTEGER PRIMARY KEY CHECK (id = 1),
+    version INTEGER NOT NULL
+);
+
 -- files: one row per MCAP recording. Single-valued facts live here as columns.
 CREATE TABLE IF NOT EXISTS files (
     id                INTEGER PRIMARY KEY,        -- internal id; also the keyset-pagination cursor

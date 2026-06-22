@@ -1,8 +1,12 @@
 """Tests for the DB connection, schema init, caches, and id resolvers."""
 
+import sqlite3
+
 import pytest
 
 from mcap_catalog_builder.db import (
+    SCHEMA_VERSION,
+    SchemaVersionError,
     load_caches,
     open_db,
     record_failure,
@@ -43,6 +47,57 @@ def test_open_db_idempotent(tmp_path):
 def test_pragmas_on_file_db(conn):
     assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
     assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+
+def test_schema_version_stamped_on_fresh_db(conn):
+    # A fresh DB is stamped with the current SCHEMA_VERSION, exactly one row, id=1.
+    rows = conn.execute("SELECT id, version FROM schema_version").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["id"] == 1
+    assert rows[0]["version"] == SCHEMA_VERSION
+
+
+def test_schema_version_single_row_enforced(conn):
+    # CHECK(id=1) makes the table structurally single-row: a second row is rejected.
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO schema_version(id, version) VALUES (2, 99)")
+
+
+def test_schema_version_idempotent_reopen(tmp_path):
+    # Re-opening a DB already at the current version must not error or duplicate.
+    p = str(tmp_path / "c.db")
+    open_db(p).close()
+    c = open_db(p)
+    try:
+        assert c.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1
+    finally:
+        c.close()
+
+
+def test_open_db_refuses_foreign_db(tmp_path):
+    # A DB that already has tables but no schema_version (e.g. a legacy Go-written
+    # catalog) must be REFUSED, not silently stamped as auryn v1 — otherwise the
+    # cross-language interlock is defeated (the Go reader would accept it).
+    p = str(tmp_path / "legacy.db")
+    raw = sqlite3.connect(p)
+    raw.execute("CREATE TABLE files (id INTEGER PRIMARY KEY, s3_key TEXT)")  # Go-ish shape
+    raw.commit()
+    raw.close()
+    with pytest.raises(SchemaVersionError):
+        open_db(p)
+
+
+def test_schema_version_mismatch_fails_fast(tmp_path):
+    # A DB stamped with a DIFFERENT version must fail fast on open (never silently
+    # served under an incompatible builder/reader).
+    p = str(tmp_path / "c.db")
+    open_db(p).close()
+    raw = sqlite3.connect(p)
+    raw.execute("UPDATE schema_version SET version = ? WHERE id = 1", (SCHEMA_VERSION + 1,))
+    raw.commit()
+    raw.close()
+    with pytest.raises(SchemaVersionError):
+        open_db(p)
 
 
 def test_resolve_customer_idempotent(conn):

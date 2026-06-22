@@ -40,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--s3-prefix", default="", help="[s3] key prefix to scope listing")
     p.add_argument("--sqs-url", default=None, help="[s3] SQS queue URL for S3 event notifications")
     p.add_argument("--db", default=DEFAULT_DB, help=f"catalog DB path (default: {DEFAULT_DB})")
+    p.add_argument("--once", action="store_true",
+                   help="run one synchronous full reconcile, then exit (no watching). "
+                        "Used by the cross-language e2e / CI to build a DB and hand it "
+                        "to the Go read-only server.")
     p.add_argument("--rescan-interval", type=float, default=300.0,
                    help="seconds between safety re-scans (default: 300)")
     p.add_argument("--debounce", type=float, default=2.0,
@@ -101,8 +105,14 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- build + validate the source (producers are started later) -----------
     if args.source == "s3":
-        if not args.s3_bucket or not args.sqs_url:
-            logger.error("--source s3 requires --s3-bucket and --sqs-url")
+        # --once does a single full_reconcile (a LIST + catalog sweep) and exits, so
+        # it needs only the bucket — no SQS event queue. The watch daemon still
+        # requires --sqs-url to drain live S3 events.
+        if not args.s3_bucket:
+            logger.error("--source s3 requires --s3-bucket")
+            return 2
+        if not args.once and not args.sqs_url:
+            logger.error("--source s3 requires --sqs-url (or pass --once for a one-shot reconcile)")
             return 2
         import boto3  # imported lazily so local mode has no boto3 dependency
         from .s3_storage import S3Source
@@ -134,6 +144,14 @@ def main(argv: list[str] | None = None) -> int:
 
     logger.info("startup reconcile (db=%s)", args.db)
     full_reconcile(conn, caches, source)  # synchronous, before watching for events
+
+    # One-shot mode: the synchronous reconcile above already built the full catalog.
+    # Exit cleanly without starting any producer/rescan thread — the caller (the
+    # Go read-only server, the cross-language e2e, CI) takes over the DB from here.
+    if args.once:
+        conn.close()
+        logger.info("--once: reconcile complete, exiting")
+        return 0
 
     start_producer()  # begin enqueuing live events only after the reconcile
 

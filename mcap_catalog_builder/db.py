@@ -18,9 +18,30 @@ logger = logging.getLogger(__name__)
 
 _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 
+# SCHEMA_VERSION pins the cross-language catalog contract (see CATALOG_CONTRACT.md):
+# the single integer the Python writer and the Go reader must agree on. The builder
+# writes it into the schema_version table; the Go reader and open_db below both fail
+# fast on mismatch. BUMP THIS on any change to a table/column the Go reader reads
+# (the contract doc enumerates them) — never on a writer-internal change.
+SCHEMA_VERSION = 1
+
+
+class SchemaVersionError(RuntimeError):
+    """An existing catalog DB was written under an incompatible schema version.
+
+    Recovery is to rebuild the catalog (delete the DB so it is re-created at the
+    current version) or run a builder whose SCHEMA_VERSION matches the DB.
+    """
+
 
 def open_db(path: str) -> sqlite3.Connection:
-    """Open (creating/upgrading) the catalog DB with WAL + FK + busy_timeout."""
+    """Open (creating/upgrading) the catalog DB with WAL + FK + busy_timeout.
+
+    After applying the schema, pins/validates the cross-language ``schema_version``
+    row: a fresh DB is stamped with ``SCHEMA_VERSION``; an existing DB whose version
+    differs raises ``SchemaVersionError`` (fail fast — never silently write the wrong
+    shape under a stale reader, or read a stale shape under a new writer).
+    """
     # isolation_level="" pins legacy deferred-transaction control, so `with conn:`
     # reliably commits on success / rolls back on exception across Python versions.
     conn = sqlite3.connect(path, check_same_thread=False, isolation_level="")
@@ -28,9 +49,60 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
+    # Guard BEFORE any DDL: refuse a DB that already has tables but no
+    # schema_version (a legacy Go-written / foreign catalog). Applying schema.sql
+    # first would CREATE the schema_version table and then stamp it v1 — silently
+    # certifying a non-auryn DB as compatible and defeating the cross-language
+    # interlock (the Go reader would then accept it). Fail fast instead.
+    _guard_not_foreign_db(conn, path)
     conn.executescript(_SCHEMA_PATH.read_text())
     conn.commit()
+    _ensure_schema_version(conn)
     return conn
+
+
+def _guard_not_foreign_db(conn: sqlite3.Connection, path: str) -> None:
+    """Refuse to write a DB that has tables but is not an auryn catalog.
+
+    A fresh DB (no user tables) and an auryn DB (already has ``schema_version``)
+    both pass; a legacy/foreign DB fails fast — see the call site for why this MUST
+    run before any schema DDL.
+    """
+    tables = {
+        r[0]
+        for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if tables and "schema_version" not in tables:
+        raise SchemaVersionError(
+            f"{path!r} has tables but no schema_version — not an auryn-built catalog "
+            f"(a legacy Go-written or foreign DB?). Refusing to write it. Use a fresh "
+            f"path or delete the DB."
+        )
+
+
+def _ensure_schema_version(conn: sqlite3.Connection) -> None:
+    """Stamp a fresh DB with ``SCHEMA_VERSION``; fail fast if an existing one differs.
+
+    Race-safe: ``INSERT OR IGNORE`` wins-or-noops if two openers race a fresh DB,
+    then the authoritative row is re-read and compared. A row that exists at a
+    different version (an older/newer build) raises ``SchemaVersionError``.
+    """
+    conn.execute(
+        "INSERT OR IGNORE INTO schema_version(id, version) VALUES (1, ?)", (SCHEMA_VERSION,)
+    )
+    conn.commit()
+    row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+    if row is None:  # unreachable after INSERT OR IGNORE, but never silently pass
+        raise SchemaVersionError("schema_version row missing after stamp (corrupt DB?)")
+    existing = row["version"]
+    if existing != SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"catalog schema_version mismatch: DB at this path was written with "
+            f"version {existing}, but this builder writes version {SCHEMA_VERSION}. "
+            f"Rebuild the catalog (delete the DB) or use a matching builder."
+        )
 
 
 def now_ns() -> int:
