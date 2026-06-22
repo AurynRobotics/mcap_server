@@ -12,7 +12,7 @@ from pathlib import Path
 
 import sqlite3
 
-from .db import Caches
+from .db import Caches, record_build
 from .builder import catalog_object, resolve_key_dims
 from .storage import LocalSource
 
@@ -85,6 +85,16 @@ def full_reconcile(conn: sqlite3.Connection, caches: Caches, source) -> dict[str
             conn.execute("DELETE FROM files WHERE id=?", (r["id"],))
             tally["deleted"] += 1
     conn.commit()
+
+    # Stamp build_metadata so the read-only Go server can report catalog freshness
+    # (§6.5). files_scanned = objects seen (cataloged + skipped); outcome is
+    # 'partial' if any file quarantined this build.
+    record_build(
+        conn,
+        files_scanned=tally["cataloged"] + tally["skipped"],
+        files_failed=tally["failed"],
+        outcome="partial" if tally["failed"] else "ok",
+    )
 
     logger.info(
         "reconcile: cataloged=%d skipped=%d failed=%d deleted=%d",

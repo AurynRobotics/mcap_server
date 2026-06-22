@@ -34,9 +34,26 @@ def test_open_db_creates_all_tables(conn):
     expected = {
         "files", "customers", "sites", "robots", "sources", "topic_names",
         "schemas", "topic_sets", "topic_set_members", "tags_embedded",
-        "tags_override", "catalog_failures",
+        "tags_override", "catalog_failures", "build_metadata",
     }
     assert expected <= tables
+
+
+def test_record_build_stamps_and_bumps_build_id(conn):
+    from mcap_catalog_builder.db import record_build
+
+    record_build(conn, files_scanned=10, files_failed=0)
+    row = conn.execute("SELECT * FROM build_metadata WHERE id=1").fetchone()
+    assert row["build_id"] == 1
+    assert row["files_scanned"] == 10 and row["files_failed"] == 0
+    assert row["build_outcome"] == "ok" and row["last_build_ns"] > 0
+
+    # A second build bumps build_id monotonically (swap-detection token).
+    record_build(conn, files_scanned=12, files_failed=2, outcome="partial")
+    row = conn.execute("SELECT * FROM build_metadata WHERE id=1").fetchone()
+    assert row["build_id"] == 2
+    assert row["files_scanned"] == 12 and row["files_failed"] == 2
+    assert row["build_outcome"] == "partial"
 
 
 def test_open_db_idempotent(tmp_path):

@@ -26,7 +26,12 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 #
 # v1 -> v2 (M2): tags -> tags_embedded + tags_override + tags_effective view (the
 #               override-survives-reindex model); files.chunk_count column.
-SCHEMA_VERSION = 2
+# v2 -> v3 (M6): build_metadata table (catalog-freshness / swap-detection §6.5/§6.2a).
+SCHEMA_VERSION = 3
+
+# BUILDER_VERSION stamps build_metadata.builder_version so an operator can see which
+# builder wrote the catalog. Bump on a builder release (independent of SCHEMA_VERSION).
+BUILDER_VERSION = "0.1.0"
 
 
 class SchemaVersionError(RuntimeError):
@@ -302,6 +307,31 @@ def update_tags(
                 conn.execute(
                     "DELETE FROM tags_override WHERE file_id=? AND key=?", (file_id, key)
                 )
+
+
+def record_build(
+    conn: sqlite3.Connection,
+    *,
+    files_scanned: int,
+    files_failed: int,
+    outcome: str = "ok",
+    version: str = BUILDER_VERSION,
+) -> None:
+    """Stamp build_metadata at the end of a reconcile (catalog freshness, §6.5).
+
+    Upserts the single row, bumping ``build_id`` monotonically so a read-only
+    reader can detect a new build (§6.2a). Commits.
+    """
+    conn.execute(
+        "INSERT INTO build_metadata(id, build_id, last_build_ns, files_scanned, "
+        "files_failed, build_outcome, builder_version) VALUES (1, 1, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET "
+        "build_id = build_metadata.build_id + 1, last_build_ns = excluded.last_build_ns, "
+        "files_scanned = excluded.files_scanned, files_failed = excluded.files_failed, "
+        "build_outcome = excluded.build_outcome, builder_version = excluded.builder_version",
+        (now_ns(), files_scanned, files_failed, outcome, version),
+    )
+    conn.commit()
 
 
 def record_failure(conn, key: str, error_text: str) -> None:

@@ -23,6 +23,21 @@ CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
 
+-- build_metadata: a single row the builder stamps at the END of each reconcile so
+-- the read-only Go server can report catalog FRESHNESS (last build time, scanned/
+-- failed counts, outcome, builder version) — replacing the in-process indexer-run
+-- signals orphaned by moving the writer out of process (§6.5). `build_id` is a
+-- monotonic counter that bumps on every completed build (swap-detection, §6.2a).
+CREATE TABLE IF NOT EXISTS build_metadata (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    build_id        INTEGER NOT NULL,           -- monotonic; +1 per completed build
+    last_build_ns   INTEGER NOT NULL,           -- when the last build completed
+    files_scanned   INTEGER NOT NULL,           -- cataloged + skipped (objects seen)
+    files_failed    INTEGER NOT NULL,           -- objects quarantined this build
+    build_outcome   TEXT    NOT NULL,           -- 'ok' | 'partial'
+    builder_version TEXT    NOT NULL
+);
+
 -- files: one row per MCAP recording. Single-valued facts live here as columns.
 CREATE TABLE IF NOT EXISTS files (
     id                INTEGER PRIMARY KEY,        -- internal id; also the keyset-pagination cursor

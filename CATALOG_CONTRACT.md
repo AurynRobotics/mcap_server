@@ -49,14 +49,15 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ```
 
-- **Current value: `2`.**
+- **Current value: `3`.**
 - History: **v1** (M1) = the cross-language interlock; **v2** (M2) = the
-  `tags_embedded`/`tags_override`/`tags_effective` override layer + `files.chunk_count`.
-- Writer source of truth: `mcap_catalog_builder/db.py` → `SCHEMA_VERSION = 2`.
+  `tags_embedded`/`tags_override`/`tags_effective` override layer + `files.chunk_count`;
+  **v3** (M6) = the `build_metadata` table (catalog freshness / swap detection).
+- Writer source of truth: `mcap_catalog_builder/db.py` → `SCHEMA_VERSION = 3`.
   `open_db` stamps a fresh DB and raises `SchemaVersionError` if an existing DB's
   version differs (and refuses a non-auryn DB before any DDL — see `open_db`).
 - Reader source of truth: `server/internal/catalog/readonly.go` → `const
-  SchemaVersion = 2`. `OpenReadOnly` raises `*SchemaVersionError` when the DB is
+  SchemaVersion = 3`. `OpenReadOnly` raises `*SchemaVersionError` when the DB is
   missing the row/table or carries a different version.
 - The two constants **MUST be equal**. They are the human-checkable pin; the
   table is the machine-checkable enforcement.
@@ -275,6 +276,14 @@ content-derived ids (and bump the version).
 decode, `s3_key` rebuild, `chunk_count`, the `tags_effective` override layer. The
 Go reader (`auryn_read.go`) serves them via the `s.readOnly` branch; the frozen 8
 `DerivedMetadataKeys` are all derivable.
+
+**`build_metadata` (v3, M6 §6.5):** a single row (`id=1`) the builder stamps at the
+end of each reconcile — `build_id` (monotonic; +1 per build, for swap detection
+§6.2a), `last_build_ns`, `files_scanned`, `files_failed`, `build_outcome`,
+`builder_version`. The Go reader reads it via `catalog.GetBuildInfo` →
+`pj_cloud_catalog_*` Prometheus gauges + the dashboard freshness panel (it replaces
+the in-process indexer-run signals orphaned by moving the writer out of process).
+Absent/empty on the legacy in-process path.
 
 **Remaining (forward, not breaking unless noted):**
 
