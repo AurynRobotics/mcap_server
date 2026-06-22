@@ -31,6 +31,7 @@ class FileSummary:
     start_time_ns: int
     end_time_ns: int
     message_count: int  # statistics.message_count — the authoritative total
+    chunk_count: int    # statistics.chunk_count — feeds files.chunk_count (Go reader's flat metadata)
     channels: list[ChannelInfo]
 
 
@@ -63,6 +64,7 @@ def summary_from_stream(stream) -> FileSummary:
         start_time_ns=summary.statistics.message_start_time,
         end_time_ns=summary.statistics.message_end_time,
         message_count=summary.statistics.message_count,
+        chunk_count=summary.statistics.chunk_count,
         channels=channels,
     )
 

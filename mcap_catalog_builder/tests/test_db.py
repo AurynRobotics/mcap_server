@@ -33,7 +33,8 @@ def test_open_db_creates_all_tables(conn):
     }
     expected = {
         "files", "customers", "sites", "robots", "sources", "topic_names",
-        "schemas", "topic_sets", "topic_set_members", "tags", "catalog_failures",
+        "schemas", "topic_sets", "topic_set_members", "tags_embedded",
+        "tags_override", "catalog_failures",
     }
     assert expected <= tables
 
@@ -85,6 +86,29 @@ def test_open_db_refuses_foreign_db(tmp_path):
     raw.close()
     with pytest.raises(SchemaVersionError):
         open_db(p)
+
+
+def test_stale_version_db_not_mutated(tmp_path):
+    # A stale-version auryn DB must be refused BEFORE any DDL — the version gate
+    # precedes executescript, so the DB is never polluted with new-version tables
+    # while still stamped at the old version (M2 review M-1).
+    p = str(tmp_path / "stale.db")
+    raw = sqlite3.connect(p)
+    raw.execute("CREATE TABLE schema_version (id INTEGER PRIMARY KEY CHECK (id=1), version INTEGER NOT NULL)")
+    raw.execute("INSERT INTO schema_version(id, version) VALUES (1, ?)", (SCHEMA_VERSION - 1,))
+    raw.execute("CREATE TABLE files (id INTEGER PRIMARY KEY)")  # a pre-existing (old) table
+    raw.commit()
+    raw.close()
+
+    with pytest.raises(SchemaVersionError):
+        open_db(p)
+
+    # No current-version tables may have been created before the gate fired.
+    raw = sqlite3.connect(p)
+    tables = {r[0] for r in raw.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    raw.close()
+    assert "tags_embedded" not in tables
+    assert "tags_override" not in tables
 
 
 def test_schema_version_mismatch_fails_fast(tmp_path):

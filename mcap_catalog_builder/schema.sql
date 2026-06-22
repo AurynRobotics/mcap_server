@@ -45,12 +45,13 @@ CREATE TABLE IF NOT EXISTS files (
     -- Recording-derived facts (from the MCAP summary/footer).
     start_time_ns     INTEGER NOT NULL,
     end_time_ns       INTEGER NOT NULL,
+    chunk_count       INTEGER NOT NULL DEFAULT 0, -- MCAP Statistics.chunk_count; Go reader's flat 'chunk_count'
 
     -- Topic layout (deduped in topic_sets) + per-file per-topic counts (blob).
     topic_set_id      INTEGER NOT NULL REFERENCES topic_sets(id),
     topic_counts      BLOB    NOT NULL,           -- one varint per set member, ordered by topic_id ASC
 
-    -- Domain flag: materialized predicate; the details live in `tags`.
+    -- Domain flag: materialized predicate; the details live in `tags_embedded`.
     has_error         INTEGER NOT NULL DEFAULT 0, -- 0/1
 
     -- Idempotency key: the parsed components uniquely identify a file.
@@ -113,14 +114,41 @@ CREATE TABLE IF NOT EXISTS topic_set_members (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS idx_tsm_topic ON topic_set_members(topic_id);
 
--- tags: open-ended key/value (1:N EAV).
-CREATE TABLE IF NOT EXISTS tags (
+-- Two-layer tags (mirrors the Go override model the migration ports in):
+--   tags_embedded  = codec/footer-derived; REWRITTEN on every re-catalog.
+--   tags_override  = user edits; NEVER touched by the builder (override-survives-reindex).
+--   tags_effective = override-wins merge VIEW (a NULL override masks the embedded tag).
+-- The builder writes only tags_embedded; update_tags() (db.py) is the sole writer of
+-- tags_override.
+CREATE TABLE IF NOT EXISTS tags_embedded (
     file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     key     TEXT    NOT NULL,
     value   TEXT    NOT NULL,
     PRIMARY KEY (file_id, key)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_tags_kv ON tags(key, value);
+CREATE INDEX IF NOT EXISTS idx_tags_embedded_kv ON tags_embedded(key, value);
+
+CREATE TABLE IF NOT EXISTS tags_override (
+    file_id    INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    key        TEXT    NOT NULL,
+    value      TEXT,                              -- NULL => mask (hide) the embedded tag
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (file_id, key)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS idx_tags_override_kv ON tags_override(key, value);
+
+-- tags_effective: a non-NULL override wins; an override with NULL value hides the
+-- embedded tag; an embedded tag with no override shows through. is_override marks
+-- the source layer (1 = override, 0 = embedded).
+CREATE VIEW IF NOT EXISTS tags_effective AS
+SELECT file_id, key, value, 1 AS is_override
+FROM tags_override
+WHERE value IS NOT NULL
+UNION ALL
+SELECT e.file_id, e.key, e.value, 0 AS is_override
+FROM tags_embedded e
+LEFT JOIN tags_override o ON (o.file_id = e.file_id AND o.key = e.key)
+WHERE o.file_id IS NULL;
 
 -- catalog_failures: files we COULD NOT catalog (keeps the raw key).
 CREATE TABLE IF NOT EXISTS catalog_failures (

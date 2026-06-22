@@ -134,6 +134,7 @@ def test_count_mismatch_guard_rolls_back(tmp_db, tmp_path, monkeypatch):
         start_time_ns=1,
         end_time_ns=2,
         message_count=999,  # does not match the channel counts below
+        chunk_count=1,
         channels=[ChannelInfo(1, "/a", "S", "ros2msg", 1)],
     )
     monkeypatch.setattr(builder, "summary_from_stream", lambda _stream: bad)
@@ -180,3 +181,73 @@ def test_catalog_vanished_file_does_not_crash(tmp_db, tmp_path):
     assert catalog_file(conn, caches, missing, root).status == "failed"
     assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0
     assert conn.execute("SELECT COUNT(*) FROM catalog_failures").fetchone()[0] == 0
+
+
+def test_chunk_count_populated(tmp_db, tmp_path):
+    # files.chunk_count is written from MCAP Statistics.chunk_count (M2 / the Go
+    # reader's flat 'chunk_count'); it matches what the summary parser reports.
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _write_hive(root)
+    catalog_file(conn, caches, dest, root)
+    row = conn.execute("SELECT chunk_count FROM files").fetchone()
+    assert row["chunk_count"] == mcap_summary.read_file_summary(dest).chunk_count
+
+
+def test_override_survives_recatalog(tmp_db, tmp_path):
+    # The override-survives-reindex invariant (Go's smoke step h): a forced
+    # re-catalog rewrites tags_embedded but NEVER touches a user override.
+    from mcap_catalog_builder.db import update_tags
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _write_hive(root)
+    catalog_file(conn, caches, dest, root)
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
+
+    update_tags(conn, fid, set_kv={"quality": "good"})  # user edit
+    st = os.stat(dest)  # force a re-catalog via mtime bump
+    os.utime(dest, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert catalog_file(conn, caches, dest, root).status == "cataloged"
+
+    row = conn.execute(
+        "SELECT value, is_override FROM tags_effective WHERE file_id=? AND key='quality'",
+        (fid,),
+    ).fetchone()
+    assert row is not None and row["value"] == "good" and row["is_override"] == 1
+
+
+def test_update_tags_set_unset_mask(tmp_db, tmp_path):
+    # set => override wins over embedded; unset of an embedded key => NULL mask
+    # (tag disappears); unset of a pure override => plain delete.
+    from mcap_catalog_builder.db import update_tags
+
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    dest = _write_hive(root)
+    catalog_file(conn, caches, dest, root)
+    fid = conn.execute("SELECT id FROM files").fetchone()["id"]
+    # seed an embedded tag directly (derive_tags is a stub today).
+    conn.execute("INSERT INTO tags_embedded(file_id, key, value) VALUES (?, 'site', 'london')", (fid,))
+    conn.commit()
+
+    update_tags(conn, fid, set_kv={"site": "paris", "mission": "inventory"})
+    eff = {
+        r["key"]: (r["value"], r["is_override"])
+        for r in conn.execute(
+            "SELECT key, value, is_override FROM tags_effective WHERE file_id=?", (fid,)
+        )
+    }
+    assert eff["site"] == ("paris", 1)         # override wins over embedded 'london'
+    assert eff["mission"] == ("inventory", 1)
+
+    update_tags(conn, fid, unset_keys=["site"])  # masks the embedded tag
+    keys = {r["key"] for r in conn.execute(
+        "SELECT key FROM tags_effective WHERE file_id=?", (fid,))}
+    assert "site" not in keys                  # NULL override hides the embedded tag
+    assert "mission" in keys
+
+    update_tags(conn, fid, unset_keys=["mission"])  # pure override => deleted
+    keys = {r["key"] for r in conn.execute(
+        "SELECT key FROM tags_effective WHERE file_id=?", (fid,))}
+    assert "mission" not in keys

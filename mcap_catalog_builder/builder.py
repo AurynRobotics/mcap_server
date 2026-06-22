@@ -174,18 +174,20 @@ def catalog_object(
                 "INSERT INTO files("
                 "filename, etag, size_bytes, last_modified_ns, cataloged_at_ns, "
                 "customer_id, site_id, robot_id, source_id, date, "
-                "start_time_ns, end_time_ns, topic_set_id, topic_counts, has_error) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "start_time_ns, end_time_ns, chunk_count, topic_set_id, topic_counts, has_error) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(customer_id, site_id, robot_id, source_id, date, filename) "
                 "DO UPDATE SET etag=excluded.etag, size_bytes=excluded.size_bytes, "
                 "last_modified_ns=excluded.last_modified_ns, cataloged_at_ns=excluded.cataloged_at_ns, "
                 "start_time_ns=excluded.start_time_ns, end_time_ns=excluded.end_time_ns, "
+                "chunk_count=excluded.chunk_count, "
                 "topic_set_id=excluded.topic_set_id, topic_counts=excluded.topic_counts, "
                 "has_error=excluded.has_error",
                 (
                     dims["filename"], st.etag, st.size, st.mtime_ns, now_ns(),
                     customer_id, site_id, robot_id, source_id, dims["date"],
-                    summary.start_time_ns, summary.end_time_ns, set_id, blob, 0,
+                    summary.start_time_ns, summary.end_time_ns, summary.chunk_count,
+                    set_id, blob, 0,
                 ),
             )
             file_id = conn.execute(
@@ -193,11 +195,13 @@ def catalog_object(
                 (*ids, dims["date"], dims["filename"]),
             ).fetchone()["id"]
 
-            conn.execute("DELETE FROM tags WHERE file_id=?", (file_id,))
+            # Embedded tags are REWRITTEN every re-catalog; tags_override is never
+            # touched here (override-survives-reindex — db.update_tags owns it).
+            conn.execute("DELETE FROM tags_embedded WHERE file_id=?", (file_id,))
             tags = derive_tags(summary)
             if tags:
                 conn.executemany(
-                    "INSERT INTO tags(file_id, key, value) VALUES (?, ?, ?)",
+                    "INSERT INTO tags_embedded(file_id, key, value) VALUES (?, ?, ?)",
                     [(file_id, k, v) for k, v in tags],
                 )
             has_error = 1 if any(is_error_tag(k, v) for k, v in tags) else 0

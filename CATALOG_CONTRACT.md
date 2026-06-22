@@ -25,13 +25,16 @@ The Go streaming subsystem (`internal/session`, `internal/ws` session path,
 storage, not the catalog. The catalog only tells it *which* object key + time
 bounds to fetch.
 
-> **Staged cutover (M1 state, 2026-06-22).** `OpenReadOnly` and this contract
-> landed in M1, but the live server still opens the catalog **read-write** via
-> `catalog.Open` (`cmd/pj-cloud-server/main.go`) — the Go indexer remains the
-> writer until **M2**, which is the read-only reader rewrite. So today both a Go
-> writer and the Python builder *can* target a DB; **do not point them at the same
-> file yet.** The reader path proven in M1 is the `crosslang` test, not production
-> wiring.
+> **Staged cutover (M2 state, 2026-06-22).** The full auryn-schema **reader** is
+> built and proven (M2: `auryn_read.go`, reached via the `s.readOnly` branch in
+> `FilterFiles`/`GetFile`/`ListTopicsForFile`/`HasHierarchicalKey`), exercised by
+> the hermetic `TestAurynReader_Hermetic` + the `crosslang` e2e + a real-bucket
+> check. But the live server **still opens the catalog read-write** via
+> `catalog.Open` + the Go indexer (`cmd/pj-cloud-server/main.go` is unchanged).
+> **The cutover is M6** (flip `main.go` to `OpenReadOnly`, delete the Go indexer,
+> migrate the smoke/matrix harness to the Python builder, resolve D2) — kept green
+> by landing it WITH the harness migration. Until then, do not point a Go writer
+> and the Python builder at the same DB file.
 
 ---
 
@@ -46,12 +49,14 @@ CREATE TABLE IF NOT EXISTS schema_version (
 );
 ```
 
-- **Current value: `1`.**
-- Writer source of truth: `mcap_catalog_builder/db.py` → `SCHEMA_VERSION = 1`.
+- **Current value: `2`.**
+- History: **v1** (M1) = the cross-language interlock; **v2** (M2) = the
+  `tags_embedded`/`tags_override`/`tags_effective` override layer + `files.chunk_count`.
+- Writer source of truth: `mcap_catalog_builder/db.py` → `SCHEMA_VERSION = 2`.
   `open_db` stamps a fresh DB and raises `SchemaVersionError` if an existing DB's
-  version differs.
+  version differs (and refuses a non-auryn DB before any DDL — see `open_db`).
 - Reader source of truth: `server/internal/catalog/readonly.go` → `const
-  SchemaVersion = 1`. `OpenReadOnly` raises `*SchemaVersionError` when the DB is
+  SchemaVersion = 2`. `OpenReadOnly` raises `*SchemaVersionError` when the DB is
   missing the row/table or carries a different version.
 - The two constants **MUST be equal**. They are the human-checkable pin; the
   table is the machine-checkable enforcement.
@@ -90,6 +95,7 @@ CREATE TABLE files (
     date              TEXT    NOT NULL,            -- READER: 'date=' partition, e.g. '2026-05-19'; s3_key rebuild
     start_time_ns     INTEGER NOT NULL,           -- READER: FileSummary.recorded.start / flat start_ns
     end_time_ns       INTEGER NOT NULL,           -- READER: FileSummary.recorded.end   / flat end_ns
+    chunk_count       INTEGER NOT NULL DEFAULT 0, -- READER: flat chunk_count (MCAP Statistics.chunk_count)
     topic_set_id      INTEGER NOT NULL,           -- READER: -> topic_set_members (topics + topic_count)
     topic_counts      BLOB    NOT NULL,           -- READER: per-topic message counts (§4)
     has_error         INTEGER NOT NULL DEFAULT 0, -- READER: error filter predicate (0/1)
@@ -98,9 +104,12 @@ CREATE TABLE files (
 ```
 
 Columns the reader **reads**: `id, filename, size_bytes, customer_id, site_id,
-robot_id, source_id, date, start_time_ns, end_time_ns, topic_set_id,
-topic_counts, has_error`. The rest (`etag, last_modified_ns, cataloged_at_ns`)
-are writer-internal change-detection bookkeeping the reader ignores.
+robot_id, source_id, date, start_time_ns, end_time_ns, chunk_count,
+topic_set_id, topic_counts`, plus `etag` (read as `FileRecord.S3ETag` for the
+session's range-GET If-Match). `has_error` is materialized by the writer but **not
+yet read** by the Go reader (reserved for a future error-filter predicate — adding
+that read does not need a version bump). The rest (`last_modified_ns,
+cataloged_at_ns`) are writer-internal change-detection bookkeeping.
 
 ### Derived wire fields → source
 
@@ -111,9 +120,9 @@ are writer-internal change-detection bookkeeping the reader ignores.
 | flat `duration_ns` | `end_time_ns - start_time_ns` |
 | `FileSummary.topic_count` / flat `topic_count` | `COUNT(*) FROM topic_set_members WHERE set_id = files.topic_set_id` |
 | `FileSummary.message_count` / flat `message_count` | `SUM(decode_counts(files.topic_counts))` |
-| `FileSummary.s3_key` / flat `s3_key` | **rebuild from dimensions** — see §5 (D1). |
-| flat `chunk_count` | `files.chunk_count` — **NOT YET A COLUMN. M2 task 2.2 adds it** (see §8). |
-| `FileSummary.tags` (+ `Tag.is_override`) | `tags` today; `tags_effective` after the M2 override port (§6). |
+| `FileSummary.s3_key` / flat `s3_key` | **rebuild from dimensions** — see §5 (D1). Go: `rebuildHiveKey` (`auryn_read.go`). |
+| flat `chunk_count` | `files.chunk_count` (MCAP `Statistics.chunk_count`; landed M2). |
+| `FileSummary.tags` (+ `Tag.is_override`) | `tags_effective` view — override-wins (§6, landed M2). Go: `EffectiveTags`. |
 | `GetFileResponse.topics[]` | `topic_set_members` ⋈ `topic_names` ⋈ `schemas` + `topic_counts` (§3,§4). |
 
 ---
@@ -198,27 +207,41 @@ customer=<c>/customer_site=<site>/robot=<r>/source=<s>/date=<d>/<filename>
 
 ---
 
-## 6. `tags` / `tags_effective` semantics
+## 6. `tags_embedded` / `tags_override` / `tags_effective` (landed M2)
 
-**M1 (today):** open-ended EAV, writer-derived.
+The two-layer override model (decision 3), mirroring the Go schema:
 
 ```sql
-tags (file_id -> files.id ON DELETE CASCADE, key, value, PRIMARY KEY(file_id,key)) WITHOUT ROWID;
+tags_embedded (file_id -> files.id ON DELETE CASCADE, key, value NOT NULL, PRIMARY KEY(file_id,key)) WITHOUT ROWID;
+tags_override (file_id -> files.id ON DELETE CASCADE, key, value /*NULL=mask*/, updated_at, PRIMARY KEY(file_id,key)) WITHOUT ROWID;
+CREATE VIEW tags_effective AS
+  SELECT file_id,key,value,1 AS is_override FROM tags_override WHERE value IS NOT NULL
+  UNION ALL
+  SELECT e.file_id,e.key,e.value,0 FROM tags_embedded e
+  LEFT JOIN tags_override o ON (o.file_id=e.file_id AND o.key=e.key) WHERE o.file_id IS NULL;
 ```
 
-**No tag extraction is implemented yet.** `derive_tags()` is a stub that returns
-`[]` (there is no `pj.user_tags` footer reader today), so the `tags` table is
-empty for the current corpus. The INTENDED source, when wired (M5 task 4.4 — real
-validation-health tags), is the **MCAP footer `pj.user_tags`** only — there is no
-S3/GCS object-custom-metadata / `Head` path planned. On the wire each tag is a
-`Tag{key, value, is_override=false}`.
-
-**M2 (planned, decision 3 — the override port):** add `tags_override(file_id,
-key, value NULLABLE, updated_at)` + a `tags_effective` override-wins view (NULL
-masks the embedded tag), and rename `tags` → `tags_embedded`. The builder writes
-embedded tags and **never touches `tags_override`** on re-catalog (the
-override-survives-reindex invariant). The reader then reads `tags_effective` and
-sets `Tag.is_override` accordingly. **That change bumps the version.**
+- **`tags_embedded`** = codec/footer-derived; the builder **REWRITES** it on every
+  re-catalog. **`tags_override`** = user edits; the builder **NEVER** touches it
+  (override-survives-reindex — the Go smoke "step h" invariant). `db.update_tags()`
+  is the **sole** writer of `tags_override`: set ⇒ non-NULL override (wins over
+  embedded); unset of an embedded key ⇒ NULL mask (hides it across re-catalog);
+  unset of a pure override ⇒ delete.
+- **`tags_effective`** = the override-wins merge the reader reads (Go `EffectiveTags`
+  + `FilterFiles`/`DistinctMetadataKeys`). `is_override` marks the source layer →
+  wire `Tag.is_override`. (Disjoint UNION ALL: the two SELECTs never share a
+  `(file_id,key)`, so no dedup is needed.)
+- **No embedded-tag extraction is implemented yet:** `derive_tags()` is a stub
+  returning `[]`, so `tags_embedded` is empty for the current corpus — but user
+  *overrides* work regardless. The intended embedded source, when wired (M5 task
+  4.4), is the **MCAP footer `pj.user_tags`** only (no S3/GCS object-metadata/`Head`
+  path).
+- **D2 (the tag-edit WRITE path) is unresolved.** The wire `UpdateTags` is
+  client→server, but the Go server is read-only. `update_tags()` is the Python
+  entry point; how a client edit *reaches* it (Go→Python IPC vs a narrow Go-writes
+  exception) is decided at the M6 cutover. Until then the Go `UpdateTags` handler
+  still writes the legacy Go-schema `tags_override` (live path), which the auryn
+  reader does not serve.
 
 ---
 
@@ -246,24 +269,30 @@ content-derived ids (and bump the version).
 
 ---
 
-## 8. Known gaps the reader/writer must close (forward, not breaking)
+## 8. Status & remaining gaps
 
-These are **planned additions**; each that the reader reads will bump the version
-when it lands:
+**Landed (v2):** all reads in §2–§6 — dimensions, topic-set + `topic_counts`
+decode, `s3_key` rebuild, `chunk_count`, the `tags_effective` override layer. The
+Go reader (`auryn_read.go`) serves them via the `s.readOnly` branch; the frozen 8
+`DerivedMetadataKeys` are all derivable.
 
-- **`files.chunk_count`** (MCAP `Statistics.chunk_count`). The frozen 8
-  `DerivedMetadataKeys` (`caps.go`) include `chunk_count`, but the auryn schema
-  does not store it yet. **M2 task 2.2 / M5 task 4.4** add the column (writer) +
-  read it (reader). Until then the reader must treat it as absent.
-- **`tags_override` + `tags_effective`** — §6, M2.
+**Remaining (forward, not breaking unless noted):**
+
+- **Cutover (M6).** The live server still opens the catalog read-WRITE
+  (`catalog.Open` + the Go indexer); the auryn reader is reached only via
+  `OpenReadOnly` (the crosslang/hermetic tests today). M6 flips `main.go`, removes
+  the Go indexer, migrates the smoke/matrix harness to the Python builder, and
+  resolves **D2** (the tag-edit write path, §6).
+- **Embedded-tag extraction (M5 task 4.4).** `derive_tags()` is a stub → wire the
+  `pj.user_tags` footer source + real `has_error` health.
 - **Raw MCAP summary bytes** (durable chunk-index warm) — migration plan §3.4,
   deferred; additive, reader-optional.
 
 ### The frozen 8 `DerivedMetadataKeys` (client-ingest contract — `caps.go`)
 
 `s3_key, size_bytes, message_count, topic_count, chunk_count, duration_ns,
-start_ns, end_ns`. All 8 MUST remain derivable from this schema. Audit this list
-before any sign-off; `chunk_count` is the one currently pending a column (above).
+start_ns, end_ns`. All 8 MUST remain derivable from this schema — and are, as of
+v2. Audit this list before any sign-off.
 
 ---
 

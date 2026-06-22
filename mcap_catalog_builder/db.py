@@ -23,7 +23,10 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 # writes it into the schema_version table; the Go reader and open_db below both fail
 # fast on mismatch. BUMP THIS on any change to a table/column the Go reader reads
 # (the contract doc enumerates them) — never on a writer-internal change.
-SCHEMA_VERSION = 1
+#
+# v1 -> v2 (M2): tags -> tags_embedded + tags_override + tags_effective view (the
+#               override-survives-reindex model); files.chunk_count column.
+SCHEMA_VERSION = 2
 
 
 class SchemaVersionError(RuntimeError):
@@ -49,15 +52,18 @@ def open_db(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 5000")
-    # Guard BEFORE any DDL: refuse a DB that already has tables but no
-    # schema_version (a legacy Go-written / foreign catalog). Applying schema.sql
-    # first would CREATE the schema_version table and then stamp it v1 — silently
-    # certifying a non-auryn DB as compatible and defeating the cross-language
-    # interlock (the Go reader would then accept it). Fail fast instead.
+    # Two guards BEFORE any DDL, so a wrong DB is NEVER mutated:
+    #  (1) a DB with tables but no schema_version (legacy Go / foreign catalog) is
+    #      refused — applying schema.sql would create+stamp it and defeat the
+    #      cross-language interlock;
+    #  (2) an EXISTING auryn DB whose version differs is refused before executescript
+    #      — otherwise the v2 schema would be committed into a v1 DB, leaving it
+    #      polluted with v2 tables yet stamped v1 (the version gate must precede DDL).
     _guard_not_foreign_db(conn, path)
+    _validate_existing_version(conn, path)
     conn.executescript(_SCHEMA_PATH.read_text())
     conn.commit()
-    _ensure_schema_version(conn)
+    _stamp_schema_version(conn)
     return conn
 
 
@@ -82,12 +88,31 @@ def _guard_not_foreign_db(conn: sqlite3.Connection, path: str) -> None:
         )
 
 
-def _ensure_schema_version(conn: sqlite3.Connection) -> None:
-    """Stamp a fresh DB with ``SCHEMA_VERSION``; fail fast if an existing one differs.
+def _validate_existing_version(conn: sqlite3.Connection, path: str) -> None:
+    """Pre-DDL: refuse an EXISTING auryn DB whose version differs, before any schema
+    is applied — so a stale-version catalog is never mutated. A fresh DB (no
+    schema_version table) or an unstamped one passes through to be stamped."""
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+    ).fetchone()
+    if has_table is None:
+        return  # fresh DB (the foreign case was already refused above)
+    row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
+    if row is not None and row["version"] != SCHEMA_VERSION:
+        raise SchemaVersionError(
+            f"catalog schema_version mismatch: {path!r} was written with version "
+            f"{row['version']}, but this builder writes version {SCHEMA_VERSION}. No "
+            f"schema was applied. Rebuild the catalog (delete the DB) or use a "
+            f"matching builder."
+        )
 
-    Race-safe: ``INSERT OR IGNORE`` wins-or-noops if two openers race a fresh DB,
-    then the authoritative row is re-read and compared. A row that exists at a
-    different version (an older/newer build) raises ``SchemaVersionError``.
+
+def _stamp_schema_version(conn: sqlite3.Connection) -> None:
+    """Post-DDL: stamp a fresh DB with ``SCHEMA_VERSION`` (race-safe), then re-validate.
+
+    ``INSERT OR IGNORE`` wins-or-noops if two openers race a fresh DB; the
+    authoritative row is then re-read and compared (a mismatch was already caught
+    pre-DDL by _validate_existing_version, but this is defense in depth).
     """
     conn.execute(
         "INSERT OR IGNORE INTO schema_version(id, version) VALUES (1, ?)", (SCHEMA_VERSION,)
@@ -96,11 +121,10 @@ def _ensure_schema_version(conn: sqlite3.Connection) -> None:
     row = conn.execute("SELECT version FROM schema_version WHERE id = 1").fetchone()
     if row is None:  # unreachable after INSERT OR IGNORE, but never silently pass
         raise SchemaVersionError("schema_version row missing after stamp (corrupt DB?)")
-    existing = row["version"]
-    if existing != SCHEMA_VERSION:
+    if row["version"] != SCHEMA_VERSION:
         raise SchemaVersionError(
-            f"catalog schema_version mismatch: DB at this path was written with "
-            f"version {existing}, but this builder writes version {SCHEMA_VERSION}. "
+            f"catalog schema_version mismatch: DB was written with version "
+            f"{row['version']}, but this builder writes version {SCHEMA_VERSION}. "
             f"Rebuild the catalog (delete the DB) or use a matching builder."
         )
 
@@ -223,6 +247,55 @@ def resolve_topic_set(
     )
     caches.topic_set[fingerprint] = set_id
     return set_id
+
+
+def update_tags(
+    conn: sqlite3.Connection,
+    file_id: int,
+    set_kv: dict[str, str] | None = None,
+    unset_keys: list[str] | None = None,
+) -> None:
+    """Apply user tag edits to ``tags_override`` (the ONLY writer of that table).
+
+    Mirrors the Go override model (SetOverride / MaskEmbedded / UnsetOverride):
+
+    - **set** ``key=value`` → upsert a non-NULL override row (override wins over any
+      embedded value for that key).
+    - **unset** ``key`` → if the file has an *embedded* tag with that key, write a
+      NULL-valued override row to MASK it (so a re-catalog that re-derives the
+      embedded tag stays hidden); otherwise just DELETE any override row.
+
+    The builder never touches ``tags_override``, so these edits survive re-catalog.
+    Commits on success (single-writer model). ``set`` is applied before ``unset``.
+    """
+    set_kv = set_kv or {}
+    unset_keys = unset_keys or []
+    now = now_ns()
+    with conn:  # one transaction: commit on success, rollback on exception
+        for key, value in set_kv.items():
+            conn.execute(
+                "INSERT INTO tags_override(file_id, key, value, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(file_id, key) DO UPDATE SET "
+                "value=excluded.value, updated_at=excluded.updated_at",
+                (file_id, key, value, now),
+            )
+        for key in unset_keys:
+            has_embedded = conn.execute(
+                "SELECT 1 FROM tags_embedded WHERE file_id=? AND key=?", (file_id, key)
+            ).fetchone()
+            if has_embedded is not None:
+                # Mask the embedded tag with a NULL override (survives re-catalog).
+                conn.execute(
+                    "INSERT INTO tags_override(file_id, key, value, updated_at) "
+                    "VALUES (?, ?, NULL, ?) "
+                    "ON CONFLICT(file_id, key) DO UPDATE SET value=NULL, updated_at=excluded.updated_at",
+                    (file_id, key, now),
+                )
+            else:
+                conn.execute(
+                    "DELETE FROM tags_override WHERE file_id=? AND key=?", (file_id, key)
+                )
 
 
 def record_failure(conn, key: str, error_text: str) -> None:
