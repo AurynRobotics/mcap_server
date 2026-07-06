@@ -64,6 +64,15 @@ def test_parser_rebuild_flag():
     assert build_parser().parse_args(["--rebuild", "d"]).rebuild is True
 
 
+def test_parser_tag_socket_default_off():
+    assert build_parser().parse_args(["d"]).tag_socket is None
+
+
+def test_parser_tag_socket_option():
+    args = build_parser().parse_args(["--tag-socket", "/tmp/x.sock", "d"])
+    assert args.tag_socket == "/tmp/x.sock"
+
+
 def _hive_one_file(root):
     dest = os.path.join(
         root,

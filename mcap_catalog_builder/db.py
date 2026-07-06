@@ -262,6 +262,29 @@ def resolve_topic_set(
     return set_id
 
 
+def lookup_file_id(conn: sqlite3.Connection, dims: dict[str, str]) -> int | None:
+    """Composite-identity file lookup by NAME (customer/site/robot/source/date/
+    filename) — lookup-only, never inserts a dimension row (unlike
+    ``resolve_customer``/``resolve_site``/... above, which insert on miss).
+
+    Used wherever a caller must resolve an *existing* file from its dimension
+    names without ever fabricating a row for an unknown one: the tags_override
+    rebuild carry-forward (``publish.py``) and the tag-edit IPC endpoint
+    (``tag_ipc.py``). Returns ``None`` if no file with that identity exists in
+    ``conn``.
+    """
+    row = conn.execute(
+        "SELECT f.id FROM files f "
+        "JOIN customers c ON c.id = f.customer_id AND c.name = ? "
+        "JOIN sites   s ON s.id = f.site_id     AND s.name = ? "
+        "JOIN robots  r ON r.id = f.robot_id    AND r.name = ? "
+        "JOIN sources x ON x.id = f.source_id   AND x.name = ? "
+        "WHERE f.date = ? AND f.filename = ?",
+        (dims["customer"], dims["site"], dims["robot"], dims["source"], dims["date"], dims["filename"]),
+    ).fetchone()
+    return row["id"] if row is not None else None
+
+
 def update_tags(
     conn: sqlite3.Connection,
     file_id: int,

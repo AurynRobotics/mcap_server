@@ -238,12 +238,13 @@ CREATE VIEW tags_effective AS
   *overrides* work regardless. The intended embedded source, when wired (M5 task
   4.4), is the **MCAP footer `pj.user_tags`** only (no S3/GCS object-metadata/`Head`
   path).
-- **D2 (the tag-edit WRITE path) is unresolved.** The wire `UpdateTags` is
-  client→server, but the Go server is read-only. `update_tags()` is the Python
-  entry point; how a client edit *reaches* it (Go→Python IPC vs a narrow Go-writes
-  exception) is decided at the M6 cutover. Until then the Go `UpdateTags` handler
-  still writes the legacy Go-schema `tags_override` (live path), which the auryn
-  reader does not serve.
+- **D2 (the tag-edit WRITE path): decided (a), Python side landed.** `update_tags()`
+  is the sole `tags_override` writer. The **tag-edit IPC endpoint** (§10) now lets
+  a forwarder — the eventual Go `UpdateTags` RPC handler — reach it over a local
+  UNIX socket, so a second DB writer never needs to exist. **Remaining (M6):**
+  wire the Go `UpdateTags` handler to forward over that socket instead of its
+  current live-path behavior (writing the legacy Go-schema `tags_override`
+  directly, which the auryn reader does not serve).
 
 ---
 
@@ -297,7 +298,8 @@ and that successive builds are moving forward.
   (`catalog.Open` + the Go indexer); the auryn reader is reached only via
   `OpenReadOnly` (the crosslang/hermetic tests today). M6 flips `main.go`, removes
   the Go indexer, migrates the smoke/matrix harness to the Python builder, and
-  resolves **D2** (the tag-edit write path, §6).
+  completes **D2** (the tag-edit write path, §6/§10) by wiring the Go
+  `UpdateTags` handler to forward over the now-landed Python IPC endpoint.
 - **Embedded-tag extraction (M5 task 4.4).** `derive_tags()` is a stub → wire the
   `pj.user_tags` footer source + real `has_error` health.
 - **Raw MCAP summary bytes** (durable chunk-index warm) — migration plan §3.4,
@@ -358,7 +360,14 @@ exists in a compatible shape:
    — if a served DB already exists — checkpoint-gates it (`PRAGMA
    wal_checkpoint(TRUNCATE)`, retried for a bounded ~5s window; **aborts the whole
    publish, leaving the served DB completely untouched,** if a concurrent reader
-   holds it busy past that window), then `os.replace`s the temp file onto the
+   holds it busy past that window). A served DB that is genuinely corrupt / not a
+   database at all (S4) is a DIFFERENT case from busy: the gate lets a raw
+   `sqlite3.Error` (as opposed to the `PublishBusyError` above) surface, and
+   `build_and_publish` treats it as garbage rather than aborting — there is no
+   verified reader that could be usefully attached to a corrupt DB anyway, so it
+   logs a warning, clears the old served path's `-wal`/`-shm` sidecars BEFORE the
+   rename (the same reasoning as the fresh-create sidecar-clearing below), and
+   lets the publish proceed. Then `os.replace`s the temp file onto the
    served path (atomic, same filesystem) and unlinks any stale `-wal`/`-shm`
    sidecars left at the served path's old generation (in the fresh-create case —
    no prior served DB — any orphaned sidecar is instead cleared *before* the
@@ -370,7 +379,17 @@ exists in a compatible shape:
    still succeed). So the published `build_id` ends up strictly greater than the
    DB it replaces only when the old value was readable; **readers must not rely
    on `build_id` monotonicity across rebuilds** — the swap trigger is file
-   identity (see point 3), never `build_id`.
+   identity (see point 3), never `build_id`. Separately, **`tags_override` is
+   carried forward** from the OLD served DB into the temp DB (right after
+   `build_fn` completes, before the temp checkpoint), by **composite file
+   identity** (customer/site/robot/source/date/filename NAMES — the only
+   identity stable across a rebuild, since `files.id` itself is renumbered, see
+   point 3): user tag edits are not derivable from the bucket, so without this a
+   `--rebuild` would silently lose every one of them. A file whose composite
+   identity is no longer present in the new build has its override **dropped**
+   (counted + logged), never resurrected under a different identity. This
+   carry-forward is best-effort exactly like the `build_id` seeding above — an
+   old DB that cannot be read is logged and skipped, never fatal to the publish.
 3. **The reader's swap trigger is file identity, not `build_id`.** A rebuild
    replaces the served DB file — a new inode — while an in-place reconcile never
    does. The reader is expected to detect this by polling `(dev, inode)` (or
@@ -387,3 +406,138 @@ exists in a compatible shape:
    network filesystems. The shared DB volume between the Python writer and the Go
    reader must never be NFS/EFS-class network storage (a local disk, a local SSD,
    or a same-host bind mount only).
+
+---
+
+## 10. Tag-edit IPC (D2(a), Python side — catalog-migration §1.1)
+
+The Go server is **read-only**; the wire `UpdateTags` RPC (client→server) must
+still reach this builder, the catalog's **sole writer**, somehow. Decision D2
+picked **(a): the Go server forwards over a local IPC endpoint; this builder
+applies the edit through its existing single-writer queue.** This section
+documents the **Python side**, landed here:
+`mcap_catalog_builder/tag_ipc.py` (the server + the queue item + its worker
+handler) and the `--tag-socket` flag in `__main__.py` (CLI + wiring). **The Go
+forwarder is a remaining M6 task** (§8) — until it lands, the Go `UpdateTags`
+handler keeps its current live-path behavior (§6).
+
+### Shape
+
+- **Transport:** a UNIX domain socket at `--tag-socket <path>` (off by
+  default). Started **only** in daemon mode, **only after** the initial
+  reconcile/publish has completed and the served DB is open in place — a tag
+  edit must never race the startup build. `--once` never serves it.
+- **Protocol:** HTTP/1.0 framing (`http.server.BaseHTTPRequestHandler`) over
+  that socket (`socketserver.UnixStreamServer` + `ThreadingMixIn`), one route:
+  `POST /update_tags`.
+- **Request body (JSON):** `{"key": "<object key>", "set_tags": {"k": "v",
+  ...}, "unset_keys": ["k", ...]}`. `set_tags` must map **string** keys to
+  **string** values (a `null`/`None` value is rejected with `400` — masking an
+  embedded tag is only ever done via `unset_keys`, never by "setting" a tag to
+  null); `unset_keys` must be a list of **strings**. Unknown top-level fields
+  are ignored.
+- **Response (JSON), by outcome:**
+  - `200 {"tags": [{"key", "value", "is_override"}, ...]}` — the file's full
+    `tags_effective` after the edit (same shape as the wire `Tag`;
+    `is_override` a JSON bool).
+  - `400 {"error": ...}` — malformed JSON body, a `key` that does not parse as
+    a Hive key / does not round-trip (`keyparse.parse_hive_key` +
+    `rebuild_hive_key` — the same trust rule the builder itself applies, §5),
+    or a `set_tags`/`unset_keys` field that fails the type validation above
+    (missing/malformed/negative `Content-Length` is also a `400`).
+  - `404 {"error": ...}` — the key parses, but no file with that composite
+    identity exists in the catalog. This is a **lookup-only** miss
+    (`db.lookup_file_id`) — a wholly unknown customer/site/robot/source in the
+    key never fabricates a dimension row, unlike the builder's own
+    `resolve_customer`/`resolve_site`/... (which insert on miss).
+  - `413 {"error": ...}` — the request body exceeds `MAX_BODY_BYTES` (see
+    "Bounded surface" below); rejected from `Content-Length` alone, before any
+    body bytes are read.
+  - `503 {"error": "busy"}` — the edit could not be confirmed applied within
+    its deadline (see below), e.g. the single writer is mid a slow full
+    reconcile, **or** the server is already at its concurrent-pending-edits
+    cap (see "Bounded surface"). Not a guarantee the edit will never apply —
+    only that this request could not confirm it in time; the caller should
+    retry.
+
+### Bounded surface (B1)
+
+The endpoint is reachable by anything with local access to the socket (see
+"Socket permissions & trust boundary" below), so it is deliberately bounded
+against a local denial-of-service, independent of the WS-level auth the Go
+server enforces upstream:
+
+- **Body size:** a `Content-Length` that is absent, non-integer, negative, or
+  above `MAX_BODY_BYTES` (1 MiB) is rejected (`400`/`413`) **before** any body
+  bytes are read.
+- **Per-connection timeout:** every handler socket carries a
+  `HANDLER_TIMEOUT_SECONDS` (10s) read/write timeout, bounding how long a
+  slow/stalled client can hold a handler thread.
+- **Bounded pending edits:** at most `MAX_PENDING_EDITS` (32) tag edits may be
+  enqueued-but-unreplied at once, enforced by a `threading.BoundedSemaphore`
+  acquired **non-blocking** in the handler **before** the item ever reaches
+  the work queue — acquisition failure is an immediate `503 {"error": "busy"}`
+  that never enqueues a `TagEditItem` and never leaves a handler thread parked
+  on `event.wait()`. This bounds both the queue depth and the number of
+  *useful* `ThreadingMixIn` handler threads regardless of how many
+  connections a local client opens.
+
+### Key-based addressing (not `file_id`)
+
+The request addresses the file by its **object key**, not the wire `file_id` /
+`files.id`. Rationale: `files.id` is renumbered across a full rebuild (§7), and
+a rebuild is exactly when a client tag edit is most likely to be in flight (the
+served DB just got replaced); a key survives that because it is rebuilt from
+stable dimension **names**, never a rowid. The handler
+(`tag_ipc.handle_tag_edit`) parses the key back into dimensions and resolves
+the CURRENT `file_id` via `db.lookup_file_id` — a lookup-only join that, unlike
+`resolve_customer`/`resolve_site`/..., never inserts a dimension row for an
+unknown file — immediately before writing, so it is always correct for
+whichever DB generation is being served at write time.
+
+### Deadline semantics
+
+Each request computes `deadline = time.monotonic() + deadline_seconds`
+(default 5s) before enqueuing a `TagEditItem`. The **worker thread**, when it
+dequeues the item, checks `time.monotonic() > item.deadline` FIRST and — if
+expired — skips the write entirely (`status = "expired"`, logged), never
+applying it late. This matters because the queue can back up behind a slow
+full reconcile: a caller that has already given up must never later see its
+edit silently land. The IPC thread's own `event.wait()` timeout is set
+ABOVE the request deadline (`deadline_seconds + 2s`, S1) so a genuine worker
+reply (`ok`/`not_found`/`expired`) is preferred over the IPC thread timing out
+on its own local wait — a `503` caused by *this* local timeout means the
+worker had not even STARTED processing the item by its deadline, so
+`handle_tag_edit`'s own deadline check will make it skip the write when it
+eventually dequeues it.
+
+Residual pathological case: if the worker dequeues the item a hair before its
+deadline and then spends longer than the 2s margin inside the one small
+`UPDATE` transaction (an unrealistically slow single-row write), the IPC
+thread can still time out and reply `503` even though the edit actually lands
+moments later. Concurrency caveat: a caller that retries after such a `503`,
+and whose retry lands as a SECOND, later write, will simply overwrite the
+first under the existing `tags_override` last-writer-wins semantic (the same
+semantic that already governs two genuinely concurrent edits) — not a new
+hazard, just the existing one surfacing through a different trigger.
+
+### Socket permissions & trust boundary
+
+The socket is `chmod`'d `0o660` (owner+group read/write) after bind. A stale
+socket file left by a crashed prior daemon is unlinked before bind — but only
+after confirming (`stat.S_ISSOCK`) that the path really IS a UNIX socket
+special file (S3): a regular file or directory already occupying that path is
+a **conflict**, not staleness, and fails startup with a clear error instead of
+being silently clobbered. The bound socket's inode is captured after bind, and
+a clean shutdown (`server_close()`) unlinks the socket file only if the path
+still refers to that same inode — if another daemon replaced it in the
+meantime (e.g. a slow shutdown racing a new instance's startup), the unlink is
+skipped and logged rather than deleting the other daemon's live socket.
+**The socket itself enforces no authentication** — a deployment is expected to
+mount it into a shared, non-world-readable directory reachable only by the Go
+server process and this builder process (the same host/pod; never a network
+mount, same constraint as point 4 above). **The Go server's WS bearer-auth
+layer is the actual auth boundary** for a client's `UpdateTags` RPC; anything
+with local access to the socket can edit tags directly, bypassing that check —
+an accepted, documented trust boundary (local IPC, not a network-facing
+endpoint), not an oversight.

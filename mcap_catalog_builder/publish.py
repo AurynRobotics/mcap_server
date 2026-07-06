@@ -15,6 +15,11 @@ Protocol (``build_and_publish``):
 
 1. Build the whole catalog in a temp file (``<served_path>.building``), never
    touching the served path.
+1a. Carry ``tags_override`` rows forward from the OLD served DB (if any) into
+   the temp DB, by composite file identity — user tag edits are NOT derivable
+   from the bucket, so a rebuild would otherwise silently lose them
+   (``_carry_forward_tags_override``; best-effort on an unreadable old DB; an
+   override whose file no longer exists in the new build is dropped).
 2. Checkpoint the temp file down to zero WAL frames and close it, so it is a
    single self-contained file with no ``-wal``/``-shm`` sidecars. This is
    *verified*, not assumed: the checkpoint's own ``busy``/``log_frames``/
@@ -53,7 +58,7 @@ import sqlite3
 import time
 from typing import Callable, TypeVar
 
-from .db import Caches, load_caches, open_db
+from .db import Caches, load_caches, lookup_file_id, open_db
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +144,93 @@ def _read_old_build_id(served_path: str) -> int | None:
         return None
 
 
+def _carry_forward_tags_override(temp_conn: sqlite3.Connection, served_path: str) -> None:
+    """Carry ``tags_override`` rows forward from the OLD served DB into the
+    freshly-built TEMP DB, by composite file identity (customer/site/robot/
+    source/date/filename NAMES) — the only identity stable across a full
+    rebuild, since ``files.id`` is renumbered (CATALOG_CONTRACT.md §7).
+
+    Without this, ``--rebuild`` silently LOSES every user-authored tag edit
+    (``tags_override`` is not derivable from the bucket, unlike everything else
+    ``build_fn`` writes). A file whose composite identity no longer exists in
+    the new build has its override DROPPED (counted + logged) rather than
+    carried — there is nothing to attach it to.
+
+    Best-effort like ``_read_old_build_id``: an absent, corrupt, or unreadable
+    old DB is not fatal (a genuine first build has no old DB to carry from) —
+    carry-forward is simply skipped, logging a warning.
+    """
+    if not os.path.exists(served_path):
+        return
+    try:
+        old_conn = sqlite3.connect(f"file:{served_path}?mode=ro", uri=True)
+        old_conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        logger.warning(
+            "could not open %s for tags_override carry-forward (starting fresh)",
+            served_path, exc_info=True,
+        )
+        return
+    try:
+        try:
+            old_rows = old_conn.execute(
+                "SELECT tho.key, tho.value, tho.updated_at, "
+                "c.name AS customer, s.name AS site, r.name AS robot, x.name AS source, "
+                "f.date AS date, f.filename AS filename "
+                "FROM tags_override tho "
+                "JOIN files f ON f.id = tho.file_id "
+                "JOIN customers c ON c.id = f.customer_id "
+                "JOIN sites   s ON s.id = f.site_id "
+                "JOIN robots  r ON r.id = f.robot_id "
+                "JOIN sources x ON x.id = f.source_id"
+            ).fetchall()
+        except sqlite3.Error:
+            logger.warning(
+                "could not read tags_override from %s (starting fresh)",
+                served_path, exc_info=True,
+            )
+            return
+    finally:
+        old_conn.close()
+
+    if not old_rows:
+        return
+
+    carried = 0
+    dropped = 0
+    with temp_conn:  # one transaction: commit on success, rollback on exception
+        for row in old_rows:
+            dims = {
+                "customer": row["customer"], "site": row["site"],
+                "robot": row["robot"], "source": row["source"],
+                "date": row["date"], "filename": row["filename"],
+            }
+            file_id = lookup_file_id(temp_conn, dims)
+            if file_id is None:
+                dropped += 1
+                # N1: log each dropped identity individually (not just the
+                # aggregate count below) so an operator can tell WHICH files'
+                # overrides were lost, not just how many.
+                logger.info(
+                    "tags_override carry-forward: dropping override (file no longer "
+                    "present) customer=%s site=%s robot=%s source=%s date=%s "
+                    "filename=%s key=%s",
+                    dims["customer"], dims["site"], dims["robot"], dims["source"],
+                    dims["date"], dims["filename"], row["key"],
+                )
+                continue
+            temp_conn.execute(
+                "INSERT INTO tags_override(file_id, key, value, updated_at) VALUES (?, ?, ?, ?)",
+                (file_id, row["key"], row["value"], row["updated_at"]),
+            )
+            carried += 1
+
+    logger.info(
+        "tags_override carry-forward from %s: %d carried, %d dropped (file no longer present)",
+        served_path, carried, dropped,
+    )
+
+
 def _seed_build_id_floor(conn: sqlite3.Connection, floor: int) -> None:
     """Pre-seed the (empty) temp DB's ``build_metadata`` row so the next
     ``record_build`` call — which does ``build_id = build_metadata.build_id + 1``
@@ -192,6 +284,12 @@ def _gate_old_served_db(served_path: str) -> None:
     the caller must NEVER rename over a served DB whose WAL may still hold
     un-checkpointed frames (a reader could later replay those stale frames into
     the new file's generation).
+
+    A genuinely corrupt/non-database ``served_path`` (as opposed to a busy
+    reader) surfaces as a plain ``sqlite3.Error`` raised straight out of
+    ``PRAGMA wal_checkpoint`` — deliberately NOT caught here (S4): the caller
+    (``build_and_publish``) distinguishes it from ``PublishBusyError`` and
+    treats it as garbage to be replaced rather than aborting the publish.
     """
     deadline = time.monotonic() + _GATE_TOTAL_SECONDS
     last = None
@@ -258,6 +356,7 @@ def build_and_publish(
                 _seed_build_id_floor(conn, floor)
             result = build_fn(conn, caches)
             _ensure_build_stamped(conn)
+            _carry_forward_tags_override(conn, served_path)
             busy, log_frames, checkpointed_frames = _checkpoint_truncate(conn)
         finally:
             conn.close()
@@ -289,6 +388,20 @@ def build_and_publish(
             _cleanup_temp(temp_path)
             logger.error("publish aborted: %s is busy, could not checkpoint-gate", served_path)
             raise
+        except sqlite3.Error:
+            # S4: a genuinely corrupt/non-database served file (NOT a busy
+            # reader — that's PublishBusyError, handled above) — there is no
+            # verified reader that could be usefully attached to it anyway, so
+            # treat it as garbage rather than aborting the publish: warn, clear
+            # its sidecars now (same reasoning as the fresh-create branch below
+            # — a stale/garbage -wal must never survive next to the new main
+            # file), and let the rename proceed.
+            logger.warning(
+                "served DB unusable; treating as garbage (%s) — will be replaced "
+                "without checkpoint-gating", served_path, exc_info=True,
+            )
+            _remove_if_exists(served_path + "-wal")
+            _remove_if_exists(served_path + "-shm")
     else:
         # Fresh create: no served DB to gate, but an orphaned sidecar could still
         # survive an operator deleting the main DB by hand. Clear it BEFORE the

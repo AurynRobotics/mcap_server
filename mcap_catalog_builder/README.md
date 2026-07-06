@@ -21,6 +21,7 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--s3-prefix` | `""` | [s3] key prefix to scope the listing |
 | `--sqs-url` | — | [s3] SQS queue URL for S3 event notifications (required for `--source s3`) |
 | `--db` | `/tmp/pj-cloud-catalog.db` | catalog SQLite file |
+| `--tag-socket` | off | path for the tag-edit IPC unix socket (daemon mode only; see [Tag-edit IPC](#tag-edit-ipc)) |
 | `--rescan-interval` | `300.0` | seconds between safety re-scans |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
 | `--stability-checks` | `3` | [local] size-stability polls before cataloging |
@@ -68,6 +69,17 @@ The `topic_counts` blob is built from the file's sorted topic-set members with
 `channel_message_counts.get(channel_id, 0)` (zero-message channels are absent from
 that dict), guarded by an in-transaction `sum(counts) == message_count` check that
 routes any mismatch to `catalog_failures` — making a wrong count impossible to commit.
+
+## Tag-edit IPC
+
+`update_tags()` (`db.py`) is the sole writer of `tags_override` — this daemon
+never accepts writes from anywhere but its own single-writer queue. A
+future/external caller (the Go read-only server's `UpdateTags` RPC handler)
+reaches it over `--tag-socket <path>`: a UNIX-socket JSON/HTTP endpoint,
+started only in daemon mode after the startup reconcile/publish completes.
+See `CATALOG_CONTRACT.md`'s "Tag-edit IPC" section (catalog-migration §1.1
+DECISION D2(a)) for the wire shape, deadline semantics, and the socket's
+trust-boundary caveat (no built-in auth — it's a local, same-host endpoint).
 
 ## S3 backend (experimental)
 

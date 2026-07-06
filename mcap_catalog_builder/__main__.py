@@ -20,6 +20,7 @@ from .builder import catalog_object, delete_by_key
 from .publish import build_and_publish
 from .reconcile import full_reconcile
 from .storage import LocalSource
+from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
 from .watcher import McapEventHandler, WatchEvent, start_observer
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gcs-bucket", default=None, help="[gcs] bucket name")
     p.add_argument("--gcs-prefix", default="", help="[gcs] object-name prefix to scope listing")
     p.add_argument("--db", default=DEFAULT_DB, help=f"catalog DB path (default: {DEFAULT_DB})")
+    p.add_argument("--tag-socket", default=None,
+                   help="path for the tag-edit IPC unix socket (default: off). Daemon "
+                        "mode only — started after the startup reconcile/publish "
+                        "completes; ignored with --once. See CATALOG_CONTRACT.md's "
+                        "'Tag-edit IPC' section (catalog-migration DECISION D2(a)).")
     p.add_argument("--once", action="store_true",
                    help="run one synchronous full reconcile, then exit (no watching). "
                         "Used by the cross-language e2e / CI to build a DB and hand it "
@@ -71,17 +77,25 @@ def worker_loop(
     conn: sqlite3.Connection,
     caches: Caches,
     source,
-    work_q: "queue.Queue[WatchEvent]",
+    work_q: "queue.Queue[WatchEvent | TagEditItem]",
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
     Backend-agnostic: each event's payload is mapped to a key via the source,
     stability is gated by the source (local polls; S3 is atomic), and every event
-    is handled under a try/except so the worker never dies.
+    is handled under a try/except so the worker never dies. Alongside
+    ``WatchEvent`` (file-system/S3-driven), the queue also carries
+    ``TagEditItem`` — a client tag edit forwarded here from the tag-edit IPC
+    server (D2(a)); it is dispatched to ``handle_tag_edit`` instead of the
+    ``ev.kind`` chain below (it needs to reply on its own ``event``, which
+    ``WatchEvent`` never carries).
     """
     while True:
         ev = work_q.get()
         try:
+            if isinstance(ev, TagEditItem):
+                handle_tag_edit(conn, caches, ev)
+                continue
             if ev.kind == "stop":
                 break
             if ev.kind == "catalog":
@@ -107,10 +121,11 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    work_q: "queue.Queue[WatchEvent]" = queue.Queue()
+    work_q: "queue.Queue[WatchEvent | TagEditItem]" = queue.Queue()
     stop_event = threading.Event()
     observer = None
     handler = None
+    tag_server = None
     start_producer = None  # deferred until after the startup reconcile
 
     # --- build + validate the source (producers are started later) -----------
@@ -199,6 +214,14 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("--once: reconcile complete, exiting")
             return 0
 
+    # Tag-edit IPC (D2(a)): daemon mode only (both --once early-returns above
+    # already skip this), and only after the served DB is open in-place — a
+    # client edit must never race the initial reconcile/publish.
+    if args.tag_socket:
+        tag_server = TagEditServer(args.tag_socket, work_q)
+        threading.Thread(target=tag_server.serve_forever, daemon=True).start()
+        logger.info("tag-edit IPC listening on %s", args.tag_socket)
+
     start_producer()  # begin enqueuing live events only after the reconcile
 
     def rescan_loop() -> None:
@@ -217,6 +240,9 @@ def main(argv: list[str] | None = None) -> int:
         worker_loop(conn, caches, source, work_q)
     finally:
         stop_event.set()
+        if tag_server is not None:
+            tag_server.shutdown()
+            tag_server.server_close()  # also unlinks the socket file
         if handler is not None:
             handler.cancel_timers()
         if observer is not None:
