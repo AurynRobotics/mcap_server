@@ -23,6 +23,7 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--db` | `/tmp/pj-cloud-catalog.db` | catalog SQLite file |
 | `--tag-socket` | off | path for the tag-edit IPC unix socket (daemon mode only; see [Tag-edit IPC](#tag-edit-ipc)) |
 | `--rescan-interval` | `300.0` | seconds between safety re-scans |
+| `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then rescan-only, driven purely by `--rescan-interval`. With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
 | `--stability-checks` | `3` | [local] size-stability polls before cataloging |
 | `--stability-interval` | `0.5` | [local] seconds between stability polls |
@@ -31,6 +32,16 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 On startup it runs a full **reconcile** (catalog missing objects, hard-delete vanished
 rows), then watches for changes — via `watchdog` (inotify) for `local`, or by draining
 **S3→SQS** notifications for `s3` — plus a periodic safety re-scan.
+
+**`--no-watch` (rescan-only daemon).** Pass `--no-watch` to skip starting any live
+event producer at all: no `watchdog`/inotify observer for `local`, no SQS long-poll
+thread for `s3`. The startup reconcile, the periodic `--rescan-interval` re-scan
+thread, the worker loop, and the tag-edit IPC server (`--tag-socket`) all still run
+exactly as without the flag — only file *discovery* changes, to purely
+rescan-driven. This is for hosts where inotify is unavailable (e.g. exhausted
+`fs.inotify.max_user_instances`) or where SQS isn't wired up yet; `--source gcs` is
+already rescan-only, so `--no-watch` is a harmless no-op there, and it's likewise a
+no-op with `--once` (which never starts a producer regardless).
 
 ## How dimensions are resolved
 

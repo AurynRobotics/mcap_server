@@ -62,6 +62,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "mode (rebuilds first, then watches the published path in place).")
     p.add_argument("--rescan-interval", type=float, default=300.0,
                    help="seconds between safety re-scans (default: 300)")
+    p.add_argument("--no-watch", action="store_true",
+                   help="daemon mode: start no live event producer at all — no "
+                        "local watchdog/inotify observer, no S3 SQS long-poll "
+                        "thread. Discovery is then rescan-only, driven purely by "
+                        "--rescan-interval (useful on hosts where inotify is "
+                        "unavailable/exhausted, or where SQS is not wired up). "
+                        "With --source s3 in daemon mode, also relaxes the "
+                        "--sqs-url requirement. GCS daemon mode is already "
+                        "rescan-only, so this is a no-op there. No-op with "
+                        "--once (which never starts a producer anyway).")
     p.add_argument("--debounce", type=float, default=2.0,
                    help="[local] seconds to debounce file events (default: 2)")
     p.add_argument("--stability-checks", type=int, default=3,
@@ -132,12 +142,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.source == "s3":
         # --once does a single full_reconcile (a LIST + catalog sweep) and exits, so
         # it needs only the bucket — no SQS event queue. The watch daemon still
-        # requires --sqs-url to drain live S3 events.
+        # requires --sqs-url to drain live S3 events, unless --no-watch says to
+        # skip live event producers altogether (rescan-only daemon).
         if not args.s3_bucket:
             logger.error("--source s3 requires --s3-bucket")
             return 2
-        if not args.once and not args.sqs_url:
-            logger.error("--source s3 requires --sqs-url (or pass --once for a one-shot reconcile)")
+        if not args.once and not args.no_watch and not args.sqs_url:
+            logger.error(
+                "--source s3 requires --sqs-url (or pass --once for a one-shot "
+                "reconcile, or --no-watch for a rescan-only daemon)"
+            )
             return 2
         import boto3  # imported lazily so local mode has no boto3 dependency
         from .s3_storage import S3Source
@@ -222,7 +236,16 @@ def main(argv: list[str] | None = None) -> int:
         threading.Thread(target=tag_server.serve_forever, daemon=True).start()
         logger.info("tag-edit IPC listening on %s", args.tag_socket)
 
-    start_producer()  # begin enqueuing live events only after the reconcile
+    if args.no_watch:
+        # Rescan-only daemon: no watchdog/inotify observer, no SQS long-poll
+        # thread — files are discovered purely by the periodic rescan thread
+        # started below. `observer`/`handler` stay None, so the shutdown
+        # `finally` block below is naturally a no-op for them.
+        logger.info(
+            "discovery is rescan-only (--no-watch): interval=%ss", args.rescan_interval
+        )
+    else:
+        start_producer()  # begin enqueuing live events only after the reconcile
 
     def rescan_loop() -> None:
         while not stop_event.wait(args.rescan_interval):
