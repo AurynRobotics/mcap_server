@@ -1,8 +1,10 @@
 """Tests for the CLI parser and the single-writer worker loop."""
 
+import os
 import queue
 
 from mcap_catalog_builder.__main__ import build_parser, main, worker_loop
+from mcap_catalog_builder.tests.fixtures import write_minimal_mcap
 from mcap_catalog_builder.watcher import WatchEvent
 
 
@@ -55,6 +57,47 @@ def test_main_s3_daemon_without_sqs_returns_2():
 def test_parser_once_flag():
     assert build_parser().parse_args(["d"]).once is False
     assert build_parser().parse_args(["--once", "d"]).once is True
+
+
+def test_parser_rebuild_flag():
+    assert build_parser().parse_args(["d"]).rebuild is False
+    assert build_parser().parse_args(["--rebuild", "d"]).rebuild is True
+
+
+def _hive_one_file(root):
+    dest = os.path.join(
+        root,
+        "customer=dexory", "customer_site=london", "robot=rob01",
+        "source=ros-bags", "date=2026-06-01", "a.mcap",
+    )
+    write_minimal_mcap(dest)
+
+
+def test_once_rebuild_on_existing_db_goes_through_publish_path(tmp_path):
+    root = str(tmp_path / "watch")
+    db = str(tmp_path / "catalog.db")
+    _hive_one_file(root)
+
+    assert main(["--once", root, "--db", db]) == 0  # first build: create path
+    old_inode = os.stat(db).st_ino
+
+    assert main(["--once", "--rebuild", root, "--db", db]) == 0
+    new_inode = os.stat(db).st_ino
+    assert new_inode != old_inode  # --rebuild republished a NEW file (§6.2a)
+    assert not os.path.exists(db + ".building")
+
+
+def test_once_without_rebuild_on_existing_db_stays_in_place(tmp_path):
+    root = str(tmp_path / "watch")
+    db = str(tmp_path / "catalog.db")
+    _hive_one_file(root)
+
+    assert main(["--once", root, "--db", db]) == 0  # first build: create path
+    old_inode = os.stat(db).st_ino
+
+    assert main(["--once", root, "--db", db]) == 0  # second run: no --rebuild
+    new_inode = os.stat(db).st_ino
+    assert new_inode == old_inode  # in-place mutation, same file
 
 
 def test_worker_loop_stops_on_stop_event(tmp_db):

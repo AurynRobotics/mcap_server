@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS schema_version (
 -- the read-only Go server can report catalog FRESHNESS (last build time, scanned/
 -- failed counts, outcome, builder version) — replacing the in-process indexer-run
 -- signals orphaned by moving the writer out of process (§6.5). `build_id` is a
--- monotonic counter that bumps on every completed build (swap-detection, §6.2a).
+-- monotonic counter that bumps on every completed build — a freshness/confirmation
+-- value only, NOT the swap-detection trigger: the reader detects a rebuilt
+-- (temp+publish, §6.2a) catalog via file identity (dev,inode) polling on the
+-- served path, not via build_id (see CATALOG_CONTRACT.md's "Publish & reopen
+-- protocol").
 CREATE TABLE IF NOT EXISTS build_metadata (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     build_id        INTEGER NOT NULL,           -- monotonic; +1 per completed build

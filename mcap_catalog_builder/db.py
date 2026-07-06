@@ -26,7 +26,9 @@ _SCHEMA_PATH = Path(__file__).parent / "schema.sql"
 #
 # v1 -> v2 (M2): tags -> tags_embedded + tags_override + tags_effective view (the
 #               override-survives-reindex model); files.chunk_count column.
-# v2 -> v3 (M6): build_metadata table (catalog-freshness / swap-detection §6.5/§6.2a).
+# v2 -> v3 (M6): build_metadata table (catalog freshness §6.5/§6.2a; NOT the
+#               swap-detection mechanism — that trigger is file identity, see
+#               record_build's docstring and CATALOG_CONTRACT.md).
 SCHEMA_VERSION = 3
 
 # BUILDER_VERSION stamps build_metadata.builder_version so an operator can see which
@@ -319,8 +321,10 @@ def record_build(
 ) -> None:
     """Stamp build_metadata at the end of a reconcile (catalog freshness, §6.5).
 
-    Upserts the single row, bumping ``build_id`` monotonically so a read-only
-    reader can detect a new build (§6.2a). Commits.
+    Upserts the single row, bumping ``build_id`` monotonically as a
+    freshness/confirmation counter — NOT the reader's swap-detection trigger,
+    which is file identity (dev,inode) polling on the served path (see
+    CATALOG_CONTRACT.md's "Publish & reopen protocol", §6.2a). Commits.
     """
     conn.execute(
         "INSERT INTO build_metadata(id, build_id, last_build_ns, files_scanned, "

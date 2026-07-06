@@ -17,6 +17,7 @@ import threading
 
 from .db import Caches, load_caches, open_db
 from .builder import catalog_object, delete_by_key
+from .publish import build_and_publish
 from .reconcile import full_reconcile
 from .storage import LocalSource
 from .watcher import McapEventHandler, WatchEvent, start_observer
@@ -46,6 +47,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="run one synchronous full reconcile, then exit (no watching). "
                         "Used by the cross-language e2e / CI to build a DB and hand it "
                         "to the Go read-only server.")
+    p.add_argument("--rebuild", action="store_true",
+                   help="force a from-scratch rebuild published atomically (build to a "
+                        "temp DB, checkpoint-gate any existing served DB, then rename "
+                        "into place — catalog-migration §6.2a), instead of mutating the "
+                        "served DB in place. Implied automatically when --db does not "
+                        "exist yet. Valid with --once (the primary use) or in daemon "
+                        "mode (rebuilds first, then watches the published path in place).")
     p.add_argument("--rescan-interval", type=float, default=300.0,
                    help="seconds between safety re-scans (default: 300)")
     p.add_argument("--debounce", type=float, default=2.0,
@@ -156,19 +164,40 @@ def main(argv: list[str] | None = None) -> int:
             observer = start_observer(args.watch_root, handler)
             logger.info("watching %s", args.watch_root)
 
-    conn = open_db(args.db)
-    caches = load_caches(conn)
+    # Create/rebuild path: the served DB does not exist yet, or --rebuild forces a
+    # from-scratch build. Either way, a reader must never observe a half-built
+    # catalog at the served path — build to a temp DB and publish atomically
+    # (catalog-migration §6.2a), instead of creating/mutating args.db directly.
+    use_publish = args.rebuild or not os.path.exists(args.db)
 
-    logger.info("startup reconcile (db=%s)", args.db)
-    full_reconcile(conn, caches, source)  # synchronous, before watching for events
+    if use_publish:
+        logger.info("rebuild-publish (db=%s, rebuild=%s)", args.db, args.rebuild)
+        build_and_publish(args.db, lambda c, ca: full_reconcile(c, ca, source))
+        # One-shot mode: the publish above already built + published the full
+        # catalog. Exit cleanly without starting any producer/rescan thread — the
+        # caller (the Go read-only server, the cross-language e2e, CI) takes over
+        # the DB from here.
+        if args.once:
+            logger.info("--once --rebuild: publish complete, exiting")
+            return 0
+        # Daemon mode: continue watching the just-PUBLISHED path in place (the
+        # normal in-place-mutation norm resumes from here on).
+        conn = open_db(args.db)
+        caches = load_caches(conn)
+    else:
+        conn = open_db(args.db)
+        caches = load_caches(conn)
 
-    # One-shot mode: the synchronous reconcile above already built the full catalog.
-    # Exit cleanly without starting any producer/rescan thread — the caller (the
-    # Go read-only server, the cross-language e2e, CI) takes over the DB from here.
-    if args.once:
-        conn.close()
-        logger.info("--once: reconcile complete, exiting")
-        return 0
+        logger.info("startup reconcile (db=%s)", args.db)
+        full_reconcile(conn, caches, source)  # synchronous, before watching for events
+
+        # One-shot mode: the synchronous reconcile above already built the full catalog.
+        # Exit cleanly without starting any producer/rescan thread — the caller (the
+        # Go read-only server, the cross-language e2e, CI) takes over the DB from here.
+        if args.once:
+            conn.close()
+            logger.info("--once: reconcile complete, exiting")
+            return 0
 
     start_producer()  # begin enqueuing live events only after the reconcile
 

@@ -52,7 +52,8 @@ CREATE TABLE IF NOT EXISTS schema_version (
 - **Current value: `3`.**
 - History: **v1** (M1) = the cross-language interlock; **v2** (M2) = the
   `tags_embedded`/`tags_override`/`tags_effective` override layer + `files.chunk_count`;
-  **v3** (M6) = the `build_metadata` table (catalog freshness / swap detection).
+  **v3** (M6) = the `build_metadata` table (catalog freshness; `build_id` is a
+  monotonic confirmation counter, **not** the swap-detection trigger — see §9).
 - Writer source of truth: `mcap_catalog_builder/db.py` → `SCHEMA_VERSION = 3`.
   `open_db` stamps a fresh DB and raises `SchemaVersionError` if an existing DB's
   version differs (and refuses a non-auryn DB before any DDL — see `open_db`).
@@ -278,12 +279,17 @@ Go reader (`auryn_read.go`) serves them via the `s.readOnly` branch; the frozen 
 `DerivedMetadataKeys` are all derivable.
 
 **`build_metadata` (v3, M6 §6.5):** a single row (`id=1`) the builder stamps at the
-end of each reconcile — `build_id` (monotonic; +1 per build, for swap detection
-§6.2a), `last_build_ns`, `files_scanned`, `files_failed`, `build_outcome`,
+end of each reconcile — `build_id` (monotonic; +1 per completed build),
+`last_build_ns`, `files_scanned`, `files_failed`, `build_outcome`,
 `builder_version`. The Go reader reads it via `catalog.GetBuildInfo` →
 `pj_cloud_catalog_*` Prometheus gauges + the dashboard freshness panel (it replaces
 the in-process indexer-run signals orphaned by moving the writer out of process).
-Absent/empty on the legacy in-process path.
+Absent/empty on the legacy in-process path. **`build_id` is a freshness/confirmation
+value only — it is NOT the swap-detection mechanism.** A rebuild replaces the
+served DB *file* (a new inode); the reader's swap trigger is (dev, inode) identity
+polling on the served path, not `build_id` (§9's "Publish & reopen protocol").
+`build_id` merely lets an operator/dashboard confirm *which* build is being served
+and that successive builds are moving forward.
 
 **Remaining (forward, not breaking unless noted):**
 
@@ -308,9 +314,10 @@ v2. Audit this list before any sign-off.
 ## 9. Open/connection invariants
 
 - Writer DSN (`db.py`): `journal_mode=WAL`, `foreign_keys=ON`,
-  `busy_timeout=5000`. `PRAGMA synchronous` is **not set today** — it is at the
-  SQLite default. M5 task 4.3 will set it consciously (and document the agreed
-  value) in **both** the writer and the reader DSN.
+  `busy_timeout=5000`, `synchronous=NORMAL` (landed M5 task 4.3 — durable across
+  an app crash, only risking the last transaction on true power/OS loss; the
+  catalog is a rebuildable cache of the bucket, so that tradeoff favors
+  throughput). The reader DSN does not set `synchronous` (it never writes).
 - Reader DSN (`readonly.go`): `mode=ro`, `busy_timeout=5000`, `foreign_keys=ON`.
   The reader **never** applies a schema (the writer's `schema.sql` is
   authoritative; applying Go's own `CREATE TABLE` would silently diverge the
@@ -318,7 +325,65 @@ v2. Audit this list before any sign-off.
   WAL/`-shm` sidecars, so the DB's **directory must be writable** even though the
   reader never writes the DB itself — a strictly read-only mount would fail to
   open.
-- **Atomic publish / reopen (M6 task 6.2a):** when the builder rebuilds the DB
-  underneath a live reader it must build to a temp file then atomically rename;
-  the reader detects the swap and reopens. Until that lands, treat a rebuild as
-  requiring a reader restart.
+- **Atomic publish / reopen (M6 task 6.2a):** the WRITER side is landed — see
+  "Publish & reopen protocol" below. The READER-side file-identity polling +
+  reopen is not yet implemented; until it lands, a rebuild still requires a
+  reader restart in practice (the served DB *content* is always correct and
+  complete the instant the rename completes — nothing is torn — the reader
+  simply keeps its old file descriptor open across a rebuild today).
+
+### Publish & reopen protocol (M6 task 6.2a)
+
+The catalog builder (`mcap_catalog_builder/publish.py`) is the **only** writer, so
+whether a write is safe to do in place depends on whether the served DB already
+exists in a compatible shape:
+
+1. **In-place WAL mutation (the norm for an existing, schema-compatible DB).**
+   `catalog_object`'s composite-key upsert and `full_reconcile`'s deletion sweep
+   run directly against the served path, each within its own transaction. This is
+   **transactionally safe per file** (each individual write commits or rolls back
+   cleanly) but **NOT reconcile-atomic across the whole DB** — a concurrent reader
+   can observe a mid-reconcile state (some files updated, some not yet, mid-sweep).
+   That is an accepted, long-standing property: `files.id` is stable across it
+   (§7), readers already tolerate eventually-consistent catalog content, and no
+   reader ever sees a torn *row* (SQLite's own transaction isolation guarantees
+   that much).
+2. **Create / rebuild publishes via temp file + checkpoint-gate + atomic rename.**
+   When the served DB does not exist yet (first build) or must be rebuilt from
+   scratch (`--rebuild`), the builder never creates or mutates the served path
+   directly — a reader must never be able to open a half-built first catalog, or
+   observe a rebuild's deletion-then-reinsertion mid-flight. Instead:
+   `build_and_publish` builds the whole catalog into `<served_path>.building` (a
+   fresh `open_db` there), checkpoints it to zero WAL frames and closes it, then
+   — if a served DB already exists — checkpoint-gates it (`PRAGMA
+   wal_checkpoint(TRUNCATE)`, retried for a bounded ~5s window; **aborts the whole
+   publish, leaving the served DB completely untouched,** if a concurrent reader
+   holds it busy past that window), then `os.replace`s the temp file onto the
+   served path (atomic, same filesystem) and unlinks any stale `-wal`/`-shm`
+   sidecars left at the served path's old generation (in the fresh-create case —
+   no prior served DB — any orphaned sidecar is instead cleared *before* the
+   rename, so a reader can never see the new main file next to a stale WAL). A
+   rebuild's `build_id` is seeded to the old served DB's `build_id` **when that
+   old build_id is readable** (`_read_old_build_id` is best-effort: a corrupt,
+   unreadable, or absent old DB is not fatal — the seeding step just starts fresh
+   at `build_id=1`, so an operator rebuilding *because* the DB is corrupt can
+   still succeed). So the published `build_id` ends up strictly greater than the
+   DB it replaces only when the old value was readable; **readers must not rely
+   on `build_id` monotonicity across rebuilds** — the swap trigger is file
+   identity (see point 3), never `build_id`.
+3. **The reader's swap trigger is file identity, not `build_id`.** A rebuild
+   replaces the served DB file — a new inode — while an in-place reconcile never
+   does. The reader is expected to detect this by polling `(dev, inode)` (or
+   equivalent) on the served path and reopening when it changes. `build_id` is
+   *not* the swap token; it is a monotonically-increasing freshness/confirmation
+   counter an operator/dashboard can use to confirm forward progress across
+   builds (fixed in this revision — earlier drafts of this document and of
+   `schema.sql`'s `build_metadata` comment described `build_id` itself as the
+   swap-detection mechanism; that was never implemented that way and is not the
+   locked design).
+4. **WAL requires a local, same-host filesystem.** SQLite's WAL mode (and this
+   protocol's `os.replace` + directory-`fsync` atomicity) assumes POSIX rename and
+   `mmap`/lock semantics that hold on local disks but are **not** guaranteed on
+   network filesystems. The shared DB volume between the Python writer and the Go
+   reader must never be NFS/EFS-class network storage (a local disk, a local SSD,
+   or a same-host bind mount only).
