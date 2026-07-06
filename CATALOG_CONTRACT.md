@@ -25,16 +25,18 @@ The Go streaming subsystem (`internal/session`, `internal/ws` session path,
 storage, not the catalog. The catalog only tells it *which* object key + time
 bounds to fetch.
 
-> **Staged cutover (M2 state, 2026-06-22).** The full auryn-schema **reader** is
-> built and proven (M2: `auryn_read.go`, reached via the `s.readOnly` branch in
-> `FilterFiles`/`GetFile`/`ListTopicsForFile`/`HasHierarchicalKey`), exercised by
-> the hermetic `TestAurynReader_Hermetic` + the `crosslang` e2e + a real-bucket
-> check. But the live server **still opens the catalog read-write** via
-> `catalog.Open` + the Go indexer (`cmd/pj-cloud-server/main.go` is unchanged).
-> **The cutover is M6** (flip `main.go` to `OpenReadOnly`, delete the Go indexer,
-> migrate the smoke/matrix harness to the Python builder, resolve D2) — kept green
-> by landing it WITH the harness migration. Until then, do not point a Go writer
-> and the Python builder at the same DB file.
+> **Cutover COMPLETE (M6 §2.6, 2026-07-06).** The Go catalog **writer** is
+> deleted: `catalog.Open`, the write API (`UpsertFile`, `ReplaceTopicsForFile`,
+> `ReplaceEmbeddedTagsForFile`, `SetOverride`/`UnsetOverride`/`MaskEmbedded`/
+> `HasEmbeddedTag`), the write-job goroutine, and the embedded legacy
+> `schema.sql` are gone, along with `internal/indexer` (the in-process bucket
+> scanner). `catalog.OpenReadOnly` is now the **only** constructor
+> (`server/internal/catalog`), and `cmd/pj-cloud-server/main.go` always opens
+> the catalog read-only — `catalog.external_builder` / `-external-builder` /
+> `PJ_CLOUD_EXTERNAL_BUILDER` are DEPRECATED NO-OPS kept only so an existing
+> launch script or config.yaml does not fail to start. The Python
+> `mcap_catalog_builder` is the sole writer of every served catalog DB; a Go
+> process must never open one for writing again.
 
 ---
 
@@ -238,13 +240,17 @@ CREATE VIEW tags_effective AS
   *overrides* work regardless. The intended embedded source, when wired (M5 task
   4.4), is the **MCAP footer `pj.user_tags`** only (no S3/GCS object-metadata/`Head`
   path).
-- **D2 (the tag-edit WRITE path): decided (a), Python side landed.** `update_tags()`
-  is the sole `tags_override` writer. The **tag-edit IPC endpoint** (§10) now lets
-  a forwarder — the eventual Go `UpdateTags` RPC handler — reach it over a local
-  UNIX socket, so a second DB writer never needs to exist. **Remaining (M6):**
-  wire the Go `UpdateTags` handler to forward over that socket instead of its
-  current live-path behavior (writing the legacy Go-schema `tags_override`
-  directly, which the auryn reader does not serve).
+- **D2 (the tag-edit WRITE path): LANDED, both sides (2026-07-06).** `update_tags()`
+  is the sole `tags_override` writer. The **tag-edit IPC endpoint** (§10) lets the
+  Go `UpdateTags` RPC handler reach it over a local UNIX socket, so a second DB
+  writer never needs to exist. The Go side is live: when `catalog.tag_ipc_socket`
+  (`-tag-ipc-socket` / `PJ_CLOUD_TAG_IPC_SOCKET`) is configured, `handleUpdateTags`
+  forwards the edit over that socket and returns the builder's confirmed
+  `tags_effective` response; when it is NOT configured, `UpdateTags` is rejected
+  with a clear `ERROR_INVALID_REQUEST` (`readOnlyTagEditMessage`,
+  `server/internal/ws/server.go`) — there is no other write path left (the legacy
+  Go-schema direct-write behavior this paragraph used to describe is gone along
+  with the rest of the Go catalog writer, §2.6).
 
 ---
 
@@ -262,10 +268,13 @@ rowid). Two stability regimes — **do not conflate them**:
 - **Full DB replace (delete the DB file + rebuild from scratch): ids are
   RENUMBERED.** SQLite reassigns rowids, so `files.id` is NOT stable across a full
   rebuild. The catalog *content* is still correct (it is a pure cache of the
-  bucket), but any in-flight `file_id` becomes invalid. A full rebuild MUST
-  therefore be paired with a reader restart / client re-`list` — M6 task 6.2a
-  (atomic-publish + reader-reopen) formalizes this. Clients normally resolve by
-  *name* from a fresh `list`, so a browse→open after a rebuild is unaffected.
+  bucket), but any in-flight `file_id` becomes invalid. A full rebuild therefore
+  requires a client re-`list` (any `file_id` a client is still holding from
+  before the rebuild is stale) — **not** a reader (server) restart: M6 task 6.2a
+  (atomic-publish + reader-reopen, §9) means the Go reader detects the swap and
+  reopens the new generation on its own, transparently, on its next freshness
+  tick. Clients normally resolve by *name* from a fresh `list`, so a browse→open
+  after a rebuild is unaffected.
 
 If cross-*rebuild* id stability is ever required, switch to deterministic /
 content-derived ids (and bump the version).
@@ -285,21 +294,28 @@ end of each reconcile — `build_id` (monotonic; +1 per completed build),
 `builder_version`. The Go reader reads it via `catalog.GetBuildInfo` →
 `pj_cloud_catalog_*` Prometheus gauges + the dashboard freshness panel (it replaces
 the in-process indexer-run signals orphaned by moving the writer out of process).
-Absent/empty on the legacy in-process path. **`build_id` is a freshness/confirmation
-value only — it is NOT the swap-detection mechanism.** A rebuild replaces the
-served DB *file* (a new inode); the reader's swap trigger is (dev, inode) identity
-polling on the served path, not `build_id` (§9's "Publish & reopen protocol").
-`build_id` merely lets an operator/dashboard confirm *which* build is being served
-and that successive builds are moving forward.
+Present=false before the first build (the table exists but has no `id=1` row yet)
+— there is no other DB shape a Go reader can open (`OpenReadOnly` requires
+`schema_version = 3`, which always ships this table). **`build_id` is a
+freshness/confirmation value only — it is NOT the swap-detection mechanism.** A
+rebuild replaces the served DB *file* (a new inode); the reader's swap trigger is
+(dev, inode) identity polling on the served path, not `build_id` (§9's "Publish &
+reopen protocol"). `build_id` merely lets an operator/dashboard confirm *which*
+build is being served and that successive builds are moving forward.
+
+**Cutover (M6 §2.6): COMPLETE (2026-07-06).** See the box at the top of this
+document (§0) — the Go catalog writer + in-process indexer are deleted,
+`main.go` always opens the catalog read-only, and the smoke harness
+(`scripts/smoke.sh`) runs the Python builder + Go read-only server end-to-end.
+**D2 (the tag-edit write path, §6/§10) is also complete:** the Go `UpdateTags`
+handler forwards over the tag-edit IPC socket when `catalog.tag_ipc_socket` is
+configured, and rejects with a clear error when it is not (§6). `scripts/matrix.sh`
+(the deeper, real-corpus gate) is NOT yet migrated to this shape — it still
+assumes the retired in-process indexer and fails fast with a clear message
+instead of running; its migration is tracked separately (see its header comment).
 
 **Remaining (forward, not breaking unless noted):**
 
-- **Cutover (M6).** The live server still opens the catalog read-WRITE
-  (`catalog.Open` + the Go indexer); the auryn reader is reached only via
-  `OpenReadOnly` (the crosslang/hermetic tests today). M6 flips `main.go`, removes
-  the Go indexer, migrates the smoke/matrix harness to the Python builder, and
-  completes **D2** (the tag-edit write path, §6/§10) by wiring the Go
-  `UpdateTags` handler to forward over the now-landed Python IPC endpoint.
 - **Embedded-tag extraction (M5 task 4.4).** `derive_tags()` is a stub → wire the
   `pj.user_tags` footer source + real `has_error` health.
 - **Raw MCAP summary bytes** (durable chunk-index warm) — migration plan §3.4,
@@ -327,12 +343,15 @@ v2. Audit this list before any sign-off.
   WAL/`-shm` sidecars, so the DB's **directory must be writable** even though the
   reader never writes the DB itself — a strictly read-only mount would fail to
   open.
-- **Atomic publish / reopen (M6 task 6.2a):** the WRITER side is landed — see
-  "Publish & reopen protocol" below. The READER-side file-identity polling +
-  reopen is not yet implemented; until it lands, a rebuild still requires a
-  reader restart in practice (the served DB *content* is always correct and
-  complete the instant the rename completes — nothing is torn — the reader
-  simply keeps its old file descriptor open across a rebuild today).
+- **Atomic publish / reopen (M6 task 6.2a): COMPLETE, both sides.** The WRITER
+  side (temp-file + checkpoint-gate + atomic rename) is described in "Publish &
+  reopen protocol" below. The READER side is `catalog.Store.ReopenIfSwapped`
+  (`server/internal/catalog/reopen.go`), polled on a 30s ticker by `main.go`: it
+  stats the served path's `(dev, inode)` identity, and when it differs from the
+  last-observed one, reopens + re-verifies (schema version, identity-race-safe)
+  before swapping the `Store`'s handle over — so a rebuild no longer requires a
+  server restart. A rebuild-in-progress or a verification failure leaves the OLD
+  handle serving (fail-closed); the next tick retries.
 
 ### Publish & reopen protocol (M6 task 6.2a)
 
@@ -409,17 +428,18 @@ exists in a compatible shape:
 
 ---
 
-## 10. Tag-edit IPC (D2(a), Python side — catalog-migration §1.1)
+## 10. Tag-edit IPC (D2(a) — catalog-migration §1.1, LANDED both sides)
 
 The Go server is **read-only**; the wire `UpdateTags` RPC (client→server) must
 still reach this builder, the catalog's **sole writer**, somehow. Decision D2
 picked **(a): the Go server forwards over a local IPC endpoint; this builder
 applies the edit through its existing single-writer queue.** This section
-documents the **Python side**, landed here:
-`mcap_catalog_builder/tag_ipc.py` (the server + the queue item + its worker
-handler) and the `--tag-socket` flag in `__main__.py` (CLI + wiring). **The Go
-forwarder is a remaining M6 task** (§8) — until it lands, the Go `UpdateTags`
-handler keeps its current live-path behavior (§6).
+documents the **Python side**: `mcap_catalog_builder/tag_ipc.py` (the server +
+the queue item + its worker handler) and the `--tag-socket` flag in
+`__main__.py` (CLI + wiring). **The Go forwarder is also landed** (§6): when
+`catalog.tag_ipc_socket` is configured, `handleUpdateTags` forwards over this
+socket; when it is not configured, `UpdateTags` is rejected with a clear
+operator-facing error instead of falling back to any Go-side write.
 
 ### Shape
 
