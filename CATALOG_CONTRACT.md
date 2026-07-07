@@ -86,7 +86,7 @@ rebuild is always safe — see §7).
 
 ```sql
 CREATE TABLE files (
-    id                INTEGER PRIMARY KEY,        -- wire file_id; STABLE across rebuilds (§7)
+    id                INTEGER PRIMARY KEY,        -- wire file_id; stable ONLY across in-place re-catalogs — a full rebuild RENUMBERS it (§7)
     filename          TEXT    NOT NULL,           -- key leaf, e.g. "rosbox_0.mcap"
     etag              TEXT    NOT NULL,            -- change-detect fingerprint (writer-internal)
     size_bytes        INTEGER NOT NULL,           -- READER: FileSummary.size_bytes
