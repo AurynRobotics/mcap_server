@@ -247,25 +247,33 @@ def extract_summary(source, key: str, stat, dims: dict[str, str], eff_key: str) 
     result — the one source of truth for this file's identity across classify → apply
     → deletion sweep, so a re-resolve can't drift (a local ``s3_key`` override that
     changed mid-scan can't make the sweep delete the row just written). ``stat`` is the
-    listing fingerprint (no per-file HEAD). Every failure is captured; never raises."""
+    listing fingerprint (no per-file HEAD). Every failure is captured in the returned
+    Extract; this NEVER raises, so a worker can never abort the reconcile pool via
+    ``future.result()``."""
     try:
-        # Only the footer + summary are fetched — never the message body (R2).
-        with source.open_summary(key, stat.size) as stream:
-            summary = summary_from_stream(stream)
-    except Exception as e:  # noqa: BLE001
-        # Disambiguate a TOCTOU vanish (object deleted between LIST and read) from a
-        # real parse error with ONE HEAD, taken only on the error path so the happy
-        # path stays HEAD-free. A HEAD that itself errors is treated as a read error.
         try:
-            gone = source.stat(key) is None
-        except Exception:  # noqa: BLE001
-            gone = False
-        if gone:
-            logger.debug("object vanished before cataloging: %s", key)
-            return Extract(key, "vanished", dims=dims, eff_key=eff_key, stat=stat)
+            # Only the footer + summary are fetched — never the message body (R2).
+            with source.open_summary(key, stat.size) as stream:
+                summary = summary_from_stream(stream)
+        except Exception as e:  # noqa: BLE001
+            # Disambiguate a TOCTOU vanish (object deleted between LIST and read) from
+            # a real parse error with ONE HEAD, taken only on the error path so the
+            # happy path stays HEAD-free. A HEAD that itself errors is a read error.
+            try:
+                gone = source.stat(key) is None
+            except Exception:  # noqa: BLE001
+                gone = False
+            if gone:
+                logger.debug("object vanished before cataloging: %s", key)
+                return Extract(key, "vanished", dims=dims, eff_key=eff_key, stat=stat)
+            return Extract(key, "error", dims=dims, eff_key=eff_key, stat=stat,
+                           error=f"{type(e).__name__}: {e}")
+        return Extract(key, "ready", dims=dims, eff_key=eff_key, stat=stat, summary=summary)
+    except Exception as e:  # noqa: BLE001 - a worker must never crash the pool
+        # Anything unexpected (e.g. a future edit adding a raise outside the inner
+        # try) still comes back as a quarantinable Extract, not a pool-aborting raise.
         return Extract(key, "error", dims=dims, eff_key=eff_key, stat=stat,
                        error=f"{type(e).__name__}: {e}")
-    return Extract(key, "ready", dims=dims, eff_key=eff_key, stat=stat, summary=summary)
 
 
 def apply_extract(conn: sqlite3.Connection, caches: Caches, ex: Extract) -> CatalogResult:

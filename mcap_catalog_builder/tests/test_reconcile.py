@@ -147,6 +147,37 @@ def test_reconcile_skip_touches_no_summary(tmp_db, tmp_path):
     assert src.reads == []  # warm pass: summary never opened for the skipped file
 
 
+class _FlakySource(LocalSource):
+    """A LocalSource whose open_summary raises for one chosen key — simulates a
+    transient/broken read to prove a worker error quarantines only that file and
+    can never abort the parallel reconcile pool."""
+
+    def __init__(self, root: str, bad_substr: str) -> None:
+        super().__init__(root)
+        self._bad = bad_substr
+
+    def open_summary(self, key: str, size: int):
+        if self._bad in key:
+            raise RuntimeError("boom")
+        return super().open_summary(key, size)
+
+
+def test_reconcile_worker_error_quarantines_and_continues(tmp_db, tmp_path):
+    conn, caches = tmp_db
+    root = str(tmp_path / "watch")
+    _hive(root, filename="good1.mcap")
+    _hive(root, filename="bad.mcap")
+    _hive(root, filename="good2.mcap")
+    src = _FlakySource(root, bad_substr="bad.mcap")
+
+    tally = full_reconcile(conn, caches, src, workers=4)
+    assert tally["cataloged"] == 2 and tally["failed"] == 1  # pool did not abort
+    assert conn.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 2
+    assert conn.execute(
+        "SELECT COUNT(*) FROM catalog_failures WHERE s3_key LIKE '%bad.mcap'"
+    ).fetchone()[0] == 1
+
+
 def test_reconcile_deletes_removed(tmp_db, tmp_path):
     conn, caches = tmp_db
     root = str(tmp_path / "watch")
