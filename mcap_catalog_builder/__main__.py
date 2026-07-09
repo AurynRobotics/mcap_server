@@ -78,6 +78,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="[local] size-stability poll count before cataloging (default: 3)")
     p.add_argument("--stability-interval", type=float, default=0.5,
                    help="[local] seconds between size-stability polls (default: 0.5)")
+    p.add_argument("--extract-workers", type=int, default=8,
+                   help="number of threads that fetch MCAP summaries during a full "
+                        "reconcile (the network-bound, out-of-transaction read). DB "
+                        "writes stay single-threaded; this only parallelizes reads. "
+                        "1 = sequential. Higher values hide per-file round-trip "
+                        "latency on a remote bucket (default: 8).")
     p.add_argument("--log-level", default="INFO",
                    choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     return p
@@ -88,6 +94,7 @@ def worker_loop(
     caches: Caches,
     source,
     work_q: "queue.Queue[WatchEvent | TagEditItem]",
+    workers: int = 1,
 ) -> None:
     """Drain the work queue and perform all DB writes (the single writer).
 
@@ -116,7 +123,7 @@ def worker_loop(
             elif ev.kind == "delete":
                 delete_by_key(conn, caches, source.event_key(ev.path))
             elif ev.kind == "rescan":
-                full_reconcile(conn, caches, source)
+                full_reconcile(conn, caches, source, workers=workers)
             else:
                 logger.warning("unknown event: %r", ev)
         except Exception:  # noqa: BLE001 - the worker must never die
@@ -201,7 +208,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if use_publish:
         logger.info("rebuild-publish (db=%s, rebuild=%s)", args.db, args.rebuild)
-        build_and_publish(args.db, lambda c, ca: full_reconcile(c, ca, source))
+        build_and_publish(
+            args.db, lambda c, ca: full_reconcile(c, ca, source, workers=args.extract_workers)
+        )
         # One-shot mode: the publish above already built + published the full
         # catalog. Exit cleanly without starting any producer/rescan thread — the
         # caller (the Go read-only server, the cross-language e2e, CI) takes over
@@ -218,7 +227,7 @@ def main(argv: list[str] | None = None) -> int:
         caches = load_caches(conn)
 
         logger.info("startup reconcile (db=%s)", args.db)
-        full_reconcile(conn, caches, source)  # synchronous, before watching for events
+        full_reconcile(conn, caches, source, workers=args.extract_workers)  # synchronous, before watching
 
         # One-shot mode: the synchronous reconcile above already built the full catalog.
         # Exit cleanly without starting any producer/rescan thread — the caller (the
@@ -260,7 +269,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, _on_signal)
 
     try:
-        worker_loop(conn, caches, source, work_q)
+        worker_loop(conn, caches, source, work_q, workers=args.extract_workers)
     finally:
         stop_event.set()
         if tag_server is not None:

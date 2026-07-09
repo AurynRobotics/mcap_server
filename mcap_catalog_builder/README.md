@@ -24,6 +24,7 @@ python3 -m mcap_catalog_builder --source s3 --s3-bucket B --sqs-url U  # S3
 | `--tag-socket` | off | path for the tag-edit IPC unix socket (daemon mode only; see [Tag-edit IPC](#tag-edit-ipc)) |
 | `--rescan-interval` | `300.0` | seconds between safety re-scans |
 | `--no-watch` | off | daemon mode: start **no** live event producer (no local watchdog/inotify observer, no S3 SQS long-poll thread) — discovery is then rescan-only, driven purely by `--rescan-interval`. With `--source s3`, also drops the `--sqs-url` requirement. No-op for `--source gcs` (already rescan-only) and for `--once` |
+| `--extract-workers` | `8` | threads that fetch MCAP summaries during a full reconcile (the network-bound, out-of-transaction read). DB writes stay single-threaded; `1` = sequential. Higher values hide per-file round-trip latency on a remote bucket |
 | `--debounce` | `2.0` | [local] seconds to debounce file events |
 | `--stability-checks` | `3` | [local] size-stability polls before cataloging |
 | `--stability-interval` | `0.5` | [local] seconds between stability polls |

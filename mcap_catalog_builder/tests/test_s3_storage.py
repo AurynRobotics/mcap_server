@@ -86,6 +86,14 @@ def test_range_reader_seek_end_and_read_past_eof():
     assert max(end for _, end in client.ranges) <= 255
 
 
+def test_range_reader_zero_length_readinto_issues_no_request():
+    data = bytes(range(256))
+    client = FakeS3({"k": data})
+    r = S3RangeReader(client, "b", "k", len(data))
+    assert r.readinto(bytearray(0)) == 0   # empty target: no bytes=N-(N-1) range
+    assert client.ranges == []             # never hit the network
+
+
 def test_range_reader_never_downloads_whole_object():
     size = 100_000
     client = FakeS3({"k": b"\x00" * size})

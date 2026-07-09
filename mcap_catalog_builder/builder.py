@@ -52,6 +52,26 @@ class CatalogResult:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class Extract:
+    """The read-phase result for one object — dims + fetched summary, NO DB touched.
+
+    Produced by ``extract_summary`` (safe to run on a worker thread) and consumed
+    serially by ``apply_extract`` on the single writer thread. ``kind`` is one of:
+    ``ready`` (summary in hand), ``unparseable`` (bad Hive key), ``vanished``
+    (object gone between LIST and read — a TOCTOU, not a failure to record), or
+    ``error`` (summary unreadable — quarantine).
+    """
+
+    key: str
+    kind: str
+    stat: object = None
+    dims: dict[str, str] | None = None
+    eff_key: str | None = None
+    summary: object = None
+    error: str = ""
+
+
 def compute_set_fingerprint(members: list[tuple[int, int]]) -> str:
     """Stable hash of the sorted ``(topic_id, schema_id)`` members."""
     payload = json.dumps(sorted(members), separators=(",", ":"))
@@ -118,51 +138,22 @@ def _quarantine_existing(conn, ids, dims, eff_key: str, error_text: str) -> None
     conn.commit()
 
 
-def catalog_object(
-    conn: sqlite3.Connection, caches: Caches, key: str, source
-) -> CatalogResult:
-    """Catalog one MCAP object (insert or update) reading bytes via ``source``."""
-    st = source.stat(key)
-    if st is None:
-        # Vanished between listing and catalog (TOCTOU) — not a real failure; the
-        # reconcile deletion sweep removes any stale row. Don't crash or record.
-        logger.debug("object vanished before cataloging: %s", key)
-        return CatalogResult("failed", "vanished")
-
-    res = resolve_key_dims(key, source)
-    if res is None:
-        record_failure(conn, key, "unparseable key")
-        conn.commit()
-        return CatalogResult("failed", "unparseable key")
-    dims, eff_key = res
-
-    # Resolve dimension ids; commit so the (append-only) lookup rows persist.
+def _resolve_ids(conn, caches, dims) -> tuple[int, int, int, int]:
+    """Resolve the four dimension ids and commit the (append-only) lookup rows."""
     customer_id = resolve_customer(conn, caches, dims["customer"])
     site_id = resolve_site(conn, caches, customer_id, dims["site"])
     robot_id = resolve_robot(conn, caches, site_id, dims["robot"])
     source_id = resolve_source(conn, caches, dims["source"])
     conn.commit()
-    ids = (customer_id, site_id, robot_id, source_id)
+    return (customer_id, site_id, robot_id, source_id)
 
-    # Fingerprint-skip (read-only): no body read when the etag is unchanged (R4).
-    existing = _composite_row(conn, ids, dims)
-    if existing is not None and existing["etag"] == st.etag:
-        return CatalogResult("skipped")
 
-    # Read the summary OUTSIDE the transaction (slow / can throw). Only the
-    # footer + summary are fetched — never the message body (R2).
-    try:
-        with source.open_summary(key, st.size) as stream:
-            summary = summary_from_stream(stream)
-    except Exception as e:  # noqa: BLE001
-        # QUARANTINE: a file is NEVER simultaneously "cataloged" and "failed". If a
-        # previously-healthy row exists for this key (a broken RE-UPLOAD: etag
-        # changed so the skip didn't fire, summary now unreadable), delete it in the
-        # same commit as the failure — otherwise it would linger as a stale healthy
-        # row the reconcile sweep can't remove (the object still exists). (§4.6)
-        _quarantine_existing(conn, ids, dims, eff_key, f"{type(e).__name__}: {e}")
-        return CatalogResult("failed", str(e))
+def _write_file_row(conn, caches, dims, eff_key, ids, stat, summary) -> CatalogResult:
+    """The §8 per-file transaction: topic-set dedup, count check, upsert, tags.
 
+    Runs on the single writer thread. On any failure it reloads caches (so ids from
+    the rolled-back txn can't poison them) and quarantines the row (§4.6)."""
+    customer_id, site_id, robot_id, source_id = ids
     try:
         with conn:  # commit on success, rollback on exception
             by_topic: dict[int, tuple[int, int]] = {}  # topic_id -> (schema_id, count)
@@ -172,7 +163,7 @@ def catalog_object(
                 if topic_id in by_topic:  # defensive: no duplicate topics in real data
                     prev_schema, prev_count = by_topic[topic_id]
                     by_topic[topic_id] = (prev_schema, prev_count + ch.message_count)
-                    logger.warning("duplicate topic %s in %s", ch.topic, key)
+                    logger.warning("duplicate topic %s in %s", ch.topic, eff_key)
                 else:
                     by_topic[topic_id] = (schema_id, ch.message_count)
 
@@ -201,7 +192,7 @@ def catalog_object(
                 "topic_set_id=excluded.topic_set_id, topic_counts=excluded.topic_counts, "
                 "has_error=excluded.has_error",
                 (
-                    dims["filename"], st.etag, st.size, st.mtime_ns, now_ns(),
+                    dims["filename"], stat.etag, stat.size, stat.mtime_ns, now_ns(),
                     customer_id, site_id, robot_id, source_id, dims["date"],
                     summary.start_time_ns, summary.end_time_ns, summary.chunk_count,
                     set_id, blob, 0,
@@ -245,6 +236,103 @@ def catalog_object(
         return CatalogResult("failed", str(e))
 
     return CatalogResult("cataloged")
+
+
+def extract_summary(source, key: str, stat, dims: dict[str, str], eff_key: str) -> Extract:
+    """Read phase for one already-classified object: fetch the MCAP summary. **NO DB.**
+
+    Thread-safe over one ``Source`` (a boto3 client / open() are safe for concurrent
+    use), so ``full_reconcile`` can run this on a worker pool while the DB writes stay
+    single-threaded. ``dims``/``eff_key`` are the caller's SINGLE ``resolve_key_dims``
+    result — the one source of truth for this file's identity across classify → apply
+    → deletion sweep, so a re-resolve can't drift (a local ``s3_key`` override that
+    changed mid-scan can't make the sweep delete the row just written). ``stat`` is the
+    listing fingerprint (no per-file HEAD). Every failure is captured; never raises."""
+    try:
+        # Only the footer + summary are fetched — never the message body (R2).
+        with source.open_summary(key, stat.size) as stream:
+            summary = summary_from_stream(stream)
+    except Exception as e:  # noqa: BLE001
+        # Disambiguate a TOCTOU vanish (object deleted between LIST and read) from a
+        # real parse error with ONE HEAD, taken only on the error path so the happy
+        # path stays HEAD-free. A HEAD that itself errors is treated as a read error.
+        try:
+            gone = source.stat(key) is None
+        except Exception:  # noqa: BLE001
+            gone = False
+        if gone:
+            logger.debug("object vanished before cataloging: %s", key)
+            return Extract(key, "vanished", dims=dims, eff_key=eff_key, stat=stat)
+        return Extract(key, "error", dims=dims, eff_key=eff_key, stat=stat,
+                       error=f"{type(e).__name__}: {e}")
+    return Extract(key, "ready", dims=dims, eff_key=eff_key, stat=stat, summary=summary)
+
+
+def apply_extract(conn: sqlite3.Connection, caches: Caches, ex: Extract) -> CatalogResult:
+    """Write phase for a pre-fetched ``Extract`` — the serial, single-writer half.
+
+    The caller (``full_reconcile``) has already skip-filtered unchanged files, so
+    there is no fingerprint check here."""
+    if ex.kind == "vanished":
+        # Not recorded: the deletion sweep removes any stale row for a gone object.
+        return CatalogResult("failed", "vanished")
+    if ex.kind == "unparseable" or ex.dims is None:
+        record_failure(conn, ex.key, ex.error or "unparseable key")
+        conn.commit()
+        return CatalogResult("failed", ex.error or "unparseable key")
+
+    ids = _resolve_ids(conn, caches, ex.dims)
+    if ex.kind == "error":
+        _quarantine_existing(conn, ids, ex.dims, ex.eff_key, ex.error)
+        return CatalogResult("failed", ex.error)
+    return _write_file_row(conn, caches, ex.dims, ex.eff_key, ids, ex.stat, ex.summary)
+
+
+def catalog_object(
+    conn: sqlite3.Connection, caches: Caches, key: str, source, stat=None
+) -> CatalogResult:
+    """Catalog one MCAP object (insert or update) reading bytes via ``source``.
+
+    Single-file entry point (the watcher / event path). Skips BEFORE any body read
+    (R4). ``stat`` may be supplied by the caller (e.g. from a listing) to avoid a
+    per-file HEAD; otherwise it is fetched here."""
+    if stat is None:
+        stat = source.stat(key)
+    if stat is None:
+        # Vanished between listing and catalog (TOCTOU) — not a real failure; the
+        # reconcile deletion sweep removes any stale row. Don't crash or record.
+        logger.debug("object vanished before cataloging: %s", key)
+        return CatalogResult("failed", "vanished")
+
+    res = resolve_key_dims(key, source)
+    if res is None:
+        record_failure(conn, key, "unparseable key")
+        conn.commit()
+        return CatalogResult("failed", "unparseable key")
+    dims, eff_key = res
+
+    ids = _resolve_ids(conn, caches, dims)
+
+    # Fingerprint-skip (read-only): no body read when the etag is unchanged (R4).
+    existing = _composite_row(conn, ids, dims)
+    if existing is not None and existing["etag"] == stat.etag:
+        return CatalogResult("skipped")
+
+    # Read the summary OUTSIDE the transaction (slow / can throw). Only the
+    # footer + summary are fetched — never the message body (R2).
+    try:
+        with source.open_summary(key, stat.size) as stream:
+            summary = summary_from_stream(stream)
+    except Exception as e:  # noqa: BLE001
+        # QUARANTINE: a file is NEVER simultaneously "cataloged" and "failed". If a
+        # previously-healthy row exists for this key (a broken RE-UPLOAD: etag
+        # changed so the skip didn't fire, summary now unreadable), delete it in the
+        # same commit as the failure — otherwise it would linger as a stale healthy
+        # row the reconcile sweep can't remove (the object still exists). (§4.6)
+        _quarantine_existing(conn, ids, dims, eff_key, f"{type(e).__name__}: {e}")
+        return CatalogResult("failed", str(e))
+
+    return _write_file_row(conn, caches, dims, eff_key, ids, stat, summary)
 
 
 def catalog_file(

@@ -94,9 +94,9 @@ def test_no_watch_local_daemon_starts_no_observer(tmp_path, monkeypatch):
 
     reconciled = []
 
-    def spy_reconcile(conn, caches, source):
+    def spy_reconcile(conn, caches, source, workers=1):
         reconciled.append(source)
-        return real_full_reconcile(conn, caches, source)
+        return real_full_reconcile(conn, caches, source, workers=workers)
 
     monkeypatch.setattr(m, "full_reconcile", spy_reconcile)
     monkeypatch.setattr(m, "worker_loop", lambda *a, **k: None)
