@@ -561,3 +561,36 @@ layer is the actual auth boundary** for a client's `UpdateTags` RPC; anything
 with local access to the socket can edit tags directly, bypassing that check —
 an accepted, documented trust boundary (local IPC, not a network-facing
 endpoint), not an oversight.
+
+## 11. Single-writer enforcement (the process lock)
+
+"The builder is the SOLE writer of the served DB" was, until this section, a
+deploy convention. It is now a **kernel-enforced invariant**: the builder takes
+an exclusive `flock` on the sidecar file **`<db_path>.writer.lock`** at startup
+— before any DB write and before the tag-edit socket bind — in **both** daemon
+and `--once` modes, and holds it for the process lifetime.
+
+- **Conflict = fail fast.** A second builder pointed at the same `--db` exits
+  with **code 3** and a message naming the lock path and the holder's PID. It
+  must never queue behind the holder (two writers taking turns is still two
+  writers), and it touches neither the DB nor the socket before failing. This
+  closes the pre-lock hazard where a second daemon would treat the first one's
+  LIVE tag socket as stale, unlink it, and silently steal tag edits while both
+  reconcilers interleaved writes.
+- **No stale-lock recovery problem.** The kernel drops a `flock` on ANY process
+  death — crash, SIGKILL, clean exit — so a leftover lock can never block a
+  restart (unlike a pidfile). The PID written inside the file is a diagnostic
+  only, never consulted for liveness.
+- **The lock file is never unlinked.** Unlink-on-release reintroduces a
+  two-holders race (lock an orphaned inode vs. lock a re-created path). A
+  leftover `.writer.lock` next to the DB is expected and harmless.
+- **Scope = one DB path.** Builders serving *different* `--db` paths do not
+  conflict (e.g. a harness catalog alongside an interactive one).
+- **Local filesystem only** — the same constraint the catalog volume already
+  has (§9: SQLite WAL forbids NFS/EFS); `flock` is reliable exactly there. The
+  atomic publish (`--rebuild`: temp build + rename onto the served path) does
+  not touch the sidecar, so the lock spans a publish unchanged.
+- **Reader side: nothing changes.** The Go server takes no lock — it opens the
+  DB read-only and follows §9. The socket stale-cleanup in §10 is now provably
+  safe: a leftover socket can only belong to a dead builder, because a live one
+  would have held this lock.

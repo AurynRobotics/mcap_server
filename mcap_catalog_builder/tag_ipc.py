@@ -332,6 +332,10 @@ class TagEditServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
                     f"a regular file/directory there is a conflict, not a stale socket; "
                     f"remove it manually if that is safe to do"
                 )
+            # Safe under the single-writer lock (CATALOG_CONTRACT.md §11): a
+            # LIVE builder on this DB would have blocked our startup before we
+            # ever reached this bind, so a leftover socket here can only belong
+            # to a DEAD builder — removing it is stale-cleanup, never theft.
             logger.warning("removing stale tag-edit socket at %s", socket_path)
             os.remove(socket_path)
         super().__init__(socket_path, _TagEditHTTPHandler)

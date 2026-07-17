@@ -22,6 +22,7 @@ from .reconcile import full_reconcile
 from .storage import LocalSource
 from .tag_ipc import TagEditItem, TagEditServer, handle_tag_edit
 from .watcher import McapEventHandler, WatchEvent, start_observer
+from .writer_lock import WriterLockError, acquire_writer_lock
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +201,35 @@ def main(argv: list[str] | None = None) -> int:
             observer = start_observer(args.watch_root, handler)
             logger.info("watching %s", args.watch_root)
 
+    # Single-writer enforcement (CATALOG_CONTRACT.md §11): acquire the per-DB
+    # writer lock BEFORE any DB write or tag-socket bind, in BOTH daemon and
+    # --once modes. A second builder on the same --db (e.g. a --once --rebuild
+    # racing a live daemon, or a double-started deploy) fails fast here with
+    # exit code 3 instead of interleaving writes / stealing the tag socket.
+    # Held for the process lifetime (released in the finally below for
+    # in-process callers like the tests; the kernel also auto-releases it on
+    # any process death, so a crash never leaves a stale lock).
+    try:
+        writer_lock = acquire_writer_lock(args.db)
+    except WriterLockError as e:
+        logger.error("%s", e)
+        return 3
+    try:
+        return _locked_main(args, source, start_producer, work_q, stop_event,
+                            lambda: observer, lambda: handler)
+    finally:
+        writer_lock.release()
+
+
+def _locked_main(args, source, start_producer, work_q, stop_event,
+                 get_observer, get_handler) -> int:
+    """The post-lock body of main(): everything that reads or writes the served
+    DB / binds the tag socket runs under the single-writer lock. The observer/
+    handler are read through GETTERS because the local-source start_producer
+    closure assigns them in main()'s scope (nonlocal) after this function has
+    already been entered."""
+    tag_server = None
+
     # Create/rebuild path: the served DB does not exist yet, or --rebuild forces a
     # from-scratch build. Either way, a reader must never observe a half-built
     # catalog at the served path — build to a temp DB and publish atomically
@@ -275,8 +305,10 @@ def main(argv: list[str] | None = None) -> int:
         if tag_server is not None:
             tag_server.shutdown()
             tag_server.server_close()  # also unlinks the socket file
+        handler = get_handler()
         if handler is not None:
             handler.cancel_timers()
+        observer = get_observer()
         if observer is not None:
             observer.stop()
             observer.join()
